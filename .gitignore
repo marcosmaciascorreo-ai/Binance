@@ -1,0 +1,30 @@
+# Claves y configuracion sensible — NUNCA subir a GitHub
+config.env
+.env
+
+# Estado del bot — se regeneran solos
+estado.json
+riesgo.json
+blacklist.json
+reporte_diario.json
+ultimo_update_monedas.json
+emergency_stop.json
+
+# Logs
+operaciones.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trades history — opcional subir o no
+# trades_log.csv
