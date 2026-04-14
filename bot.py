@@ -948,7 +948,18 @@ def run():
     log.info("=" * 55)
 
     ganancias_data = cargar_ganancias()
-    telegram(f"🤖 Bot iniciado\nCapital: ${ganancias_data['capital']} USDT\nMonedas: {len(SYMBOLS)}\nObjetivo: +{PROFIT_PCT}% | Sin Stop Loss | Trailing: -{TRAILING_PCT}%")
+
+    # Usar capital REAL de Binance, no el guardado en archivo
+    try:
+        capital_real = float(client.get_asset_balance(asset='USDT')['free'])
+        if capital_real > 0.5:
+            ganancias_data['capital'] = round(capital_real, 4)
+            guardar_ganancias(ganancias_data)
+            log.info(f"Capital real de Binance: ${capital_real:.4f} USDT")
+    except Exception as e:
+        log.warning(f"No se pudo obtener capital real: {e}")
+
+    telegram(f"🤖 Bot iniciado\nCapital real: ${ganancias_data['capital']:.4f} USDT\nMonedas: {len(SYMBOLS)}\nObjetivo: +{PROFIT_PCT}% | Sin Stop Loss | Trailing: -{TRAILING_PCT}%\n\nAnalizando mercado...")
 
     ciclos = 0
     limpiar_monedas_sueltas()
@@ -976,10 +987,11 @@ def run():
 
     rsi_actual           = None
     ultimo_aviso_bajista = None
-    ultimo_trade_ts      = None   # timestamp del ultimo trade completado
-    cooldown_ganadores   = {}    # {symbol: datetime} — cooldown por moneda tras ganancia
+    ultimo_trade_ts      = None
+    cooldown_ganadores   = {}
     riesgo               = cargar_riesgo()
     ultimo_sharpe_check  = datetime.now()
+    ultimo_aviso_vivo    = datetime.now()
 
     while True:
         try:
@@ -988,6 +1000,22 @@ def run():
             capital_actual = ganancias_data['capital']
             enviar_reporte_diario()
             actualizar_monedas_automatico()
+
+            # Aviso de vida cada 2 horas — confirma que el bot sigue activo
+            ahora = datetime.now()
+            if (ahora - ultimo_aviso_vivo).total_seconds() >= 7200:
+                try:
+                    capital_binance = float(client.get_asset_balance(asset='USDT')['free'])
+                except Exception:
+                    capital_binance = capital_actual
+                estado_txt = f"En posicion: {symbol}" if estado == "ESPERANDO_SUBIDA" else "Buscando oportunidad"
+                telegram(
+                    f"🟢 Bot activo\n"
+                    f"Capital: ${capital_binance:.4f} USDT\n"
+                    f"Ciclos ganados: {ciclos}\n"
+                    f"Estado: {estado_txt}"
+                )
+                ultimo_aviso_vivo = ahora
 
             # ── Sharpe + ajuste de capital cada 10 ciclos ─────────────────────
             if ciclos > 0 and ciclos % 10 == 0 and (datetime.now() - ultimo_sharpe_check).seconds > 300:
