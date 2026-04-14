@@ -943,12 +943,12 @@ def print_dashboard(estado, symbol, precio_actual, precio_compra, objetivo_venta
 # ── Loop principal ────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 55)
-    log.info(f"Bot iniciado | Objetivo: +{PROFIT_PCT}% | Trailing: -{TRAILING_PCT}% | Stop Loss: -5%")
+    log.info(f"Bot iniciado | Objetivo: +{PROFIT_PCT}% | Trailing: -{TRAILING_PCT}% | Sin Stop Loss")
     log.info(f"Monedas: {', '.join(SYMBOLS)}")
     log.info("=" * 55)
 
     ganancias_data = cargar_ganancias()
-    telegram(f"🤖 Bot iniciado\nCapital: ${ganancias_data['capital']} USDT\nMonedas: {len(SYMBOLS)}\nObjetivo: +{PROFIT_PCT}% | Stop Loss: -5% | Trailing: -{TRAILING_PCT}%")
+    telegram(f"🤖 Bot iniciado\nCapital: ${ganancias_data['capital']} USDT\nMonedas: {len(SYMBOLS)}\nObjetivo: +{PROFIT_PCT}% | Sin Stop Loss | Trailing: -{TRAILING_PCT}%")
 
     ciclos = 0
     limpiar_monedas_sueltas()
@@ -1090,14 +1090,14 @@ def run():
                 # Trailing activa desde el objetivo — si sigue subiendo captura mas
                 umbral_trailing = precio_compra * (1 + TRAILING_ACTIVACION / 100)
                 trailing_stop   = precio_maximo * (1 - TRAILING_PCT / 100)
-                stop_loss       = precio_compra * 0.95
                 ya_activo_trail = precio_maximo >= umbral_trailing
                 horas_en_pos    = (datetime.now() - ts_compra_local).total_seconds() / 3600
+                caida_pct       = (precio_actual - precio_compra) / precio_compra * 100
 
                 if ya_activo_trail:
                     estado_txt = f"Trailing activo — max ${precio_maximo:.8f}"
                 else:
-                    estado_txt = f"Esperando subida... ({horas_en_pos:.1f}h)"
+                    estado_txt = f"Esperando subida... {caida_pct:+.2f}% ({horas_en_pos:.1f}h)"
 
                 print_dashboard(estado_txt, symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual, btc_info=(btc_c, btc_t))
 
@@ -1107,11 +1107,6 @@ def run():
                 elif not ya_activo_trail and precio_actual >= objetivo_venta:
                     # Llego al objetivo — activa trailing en lugar de vender directo
                     log.info(f"[TRAILING ACTIVADO] Precio supero objetivo ${objetivo_venta:.8f} — siguiendo subida")
-                elif precio_actual <= stop_loss:
-                    caida_pct = (precio_actual - precio_compra) / precio_compra * 100
-                    log.warning(f"[STOP LOSS] {symbol} cayo {caida_pct:.2f}%")
-                    telegram(f"🔴 STOP LOSS\nMoneda: {symbol}\nCaida: {caida_pct:.2f}%")
-                    estado = "STOP_LOSS"
 
             # ── VENDER ────────────────────────────────────────────────────────
             elif estado == "VENDIENDO":
@@ -1152,33 +1147,7 @@ def run():
                 precio_compra = objetivo_venta = qty = precio_maximo = ts_compra = None
                 borrar_estado()
 
-            # ── STOP LOSS ─────────────────────────────────────────────────────
-            elif estado == "STOP_LOSS":
-                print_dashboard("STOP LOSS...", symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual)
-                precio_venta    = ejecutar_venta(symbol, qty)
-                ts_compra_local = ts_compra if ts_compra else datetime.now()
-                duracion_seg    = (datetime.now() - ts_compra_local).total_seconds()
-                if precio_venta:
-                    perdida     = (precio_venta - precio_compra) * qty
-                    perdida_pct = (precio_venta - precio_compra) / precio_compra * 100
-                    slippage_real = abs(precio_venta - precio_actual) / precio_actual
-                    riesgo = registrar_resultado_ciclo(riesgo, perdida_pct, slippage_real)
-                    registrar_en_reporte(perdida, symbol)
-                    registrar_csv(symbol, precio_compra, precio_venta, qty,
-                                  perdida, perdida_pct, slippage_real,
-                                  ganancias_data['capital'], duracion_seg, 'STOP_LOSS')
-                    ultimo_trade_ts = datetime.now()
-                    agregar_blacklist(symbol)
-                    log.warning(f"[STOP LOSS] Perdida: ${perdida:.4f} USDT ({perdida_pct:.2f}%)")
-                    telegram(
-                        f"🔴 STOP LOSS ejecutado\n"
-                        f"Moneda: {symbol} (bloqueada 24h)\n"
-                        f"Perdida: {perdida_pct:.2f}% (${perdida:.4f} USDT)\n"
-                        f"Perdidas consecutivas: {riesgo['perdidas_consecutivas']}"
-                    )
-                estado = "ANALIZANDO"
-                precio_compra = objetivo_venta = qty = precio_maximo = ts_compra = None
-                borrar_estado()
+            # Sin stop loss — el bot espera hasta ganar
 
             time.sleep(CHECK_INTERVAL)
 
