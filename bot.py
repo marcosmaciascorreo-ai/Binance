@@ -891,8 +891,8 @@ def ejecutar_compra(symbol, capital):
 def ejecutar_venta(symbol, qty):
     balance_real = get_balance_coin(symbol)
     step, dec    = get_step_size(symbol)
-    balance_real = round_qty(balance_real, step, dec)
-    qty_real     = min(qty, balance_real)
+    # Vender TODO el balance real (incluye remanentes de ciclos anteriores)
+    qty_real     = round_qty(balance_real, step, dec)
     if qty_real <= 0:
         log.warning(f"Sin balance de {symbol} para vender, limpiando estado.")
         borrar_estado()
