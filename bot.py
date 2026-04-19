@@ -370,19 +370,32 @@ def enviar_reporte_diario():
     guardar_reporte_dia(data)
 
 # ── Auto-actualizacion semanal de monedas ────────────────────────────────────
-SYMBOLS_UPDATE_FILE = 'ultimo_update_monedas.json'
+SYMBOLS_UPDATE_FILE   = 'ultimo_update_monedas.json'
+_update_sesion_fecha  = None  # bandera en memoria — evita spam aunque el archivo no exista
 
 def actualizar_monedas_automatico():
-    """Cada domingo re-escanea Binance y actualiza la lista de monedas."""
+    """Cada domingo re-escanea Binance y actualiza la lista de monedas. Solo una vez."""
+    global _update_sesion_fecha
     ahora = datetime.now()
     if ahora.weekday() != 6:  # Solo domingo
         return
 
+    hoy = ahora.strftime('%Y-%m-%d')
+
+    # Bandera en memoria: ya se ejecuto hoy en esta sesion
+    if _update_sesion_fecha == hoy:
+        return
+
+    # Bandera en archivo (persiste entre reinicios del mismo dia)
     if os.path.exists(SYMBOLS_UPDATE_FILE):
         with open(SYMBOLS_UPDATE_FILE, 'r') as f:
             data = json.load(f)
-        if data.get('fecha') == ahora.strftime('%Y-%m-%d'):
-            return  # Ya se actualizo hoy
+        if data.get('fecha') == hoy:
+            _update_sesion_fecha = hoy  # sincronizar bandera en memoria
+            return
+
+    # Marcar inmediatamente para no repetir aunque falle
+    _update_sesion_fecha = hoy
 
     log.info("[AUTO-UPDATE] Actualizando lista de monedas...")
     telegram("🔄 Actualizacion semanal de monedas iniciada...")
@@ -888,7 +901,7 @@ def ejecutar_compra(symbol, capital):
     log.info(f"[COMPRA] {filled} {symbol[:-4]} a ${avg_price:.8f} | Total: ${filled * avg_price:.4f} USDT")
     return avg_price, filled
 
-def ejecutar_venta(symbol, qty):
+def ejecutar_venta(symbol):
     balance_real = get_balance_coin(symbol)
     step, dec    = get_step_size(symbol)
     # Vender TODO el balance real (incluye remanentes de ciclos anteriores)
@@ -1140,7 +1153,7 @@ def run():
             elif estado == "VENDIENDO":
                 print_dashboard("VENDIENDO...", symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual)
                 precio_esperado  = precio_actual
-                precio_venta     = ejecutar_venta(symbol, qty)
+                precio_venta     = ejecutar_venta(symbol)
                 ts_compra_local  = ts_compra if ts_compra else datetime.now()
                 duracion_seg     = (datetime.now() - ts_compra_local).total_seconds()
                 if precio_venta:
