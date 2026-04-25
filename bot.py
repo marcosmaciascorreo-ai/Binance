@@ -789,8 +789,7 @@ def elegir_mejor_moneda(cooldown_ganadores=None):
     log.info(f"  BTC 1h: {btc_cambio:+.2f}% — {btc_tendencia}")
 
     if not btc_seguro:
-        log.warning(f"  Mercado bajista detectado — esperando condiciones mejores")
-        return None, None, None
+        log.info(f"  BTC bajista — analizando monedas de todos modos (solo CRISIS bloquea)")
 
     blacklist  = limpiar_blacklist_expirada()
     historial  = historial_por_moneda()
@@ -1016,7 +1015,7 @@ def run():
 
             # Aviso de vida cada 2 horas — confirma que el bot sigue activo
             ahora = datetime.now()
-            if (ahora - ultimo_aviso_vivo).total_seconds() >= 7200:
+            if (ahora - ultimo_aviso_vivo).total_seconds() >= 18000:
                 try:
                     capital_binance = float(client.get_asset_balance(asset='USDT')['free'])
                 except Exception:
@@ -1053,7 +1052,7 @@ def run():
             # ── Regimen de mercado ────────────────────────────────────────────
             btc_seguro, btc_c, btc_t = estado_btc()
             regimen, factor_capital  = regimen_mercado(btc_c, (btc_c / 12))  # aprox 15m
-            capital_operando         = round(capital_actual * factor_capital, 4)
+            capital_operando         = round(capital_actual, 4)  # usa todo el USDT disponible
 
             # ── ANALIZAR ──────────────────────────────────────────────────────
             if estado == "ANALIZANDO":
@@ -1128,8 +1127,8 @@ def run():
                                     'precio_maximo': precio_maximo, 'ciclos': ciclos,
                                     'ts_compra': ts_compra_local.strftime('%Y-%m-%d %H:%M:%S')})
 
-                # Trailing activa desde el objetivo — si sigue subiendo captura mas
-                umbral_trailing = precio_compra * (1 + TRAILING_ACTIVACION / 100)
+                # Trailing solo activa cuando alcanzamos el objetivo — garantiza ganancia
+                umbral_trailing = objetivo_venta
                 trailing_stop   = precio_maximo * (1 - TRAILING_PCT / 100)
                 ya_activo_trail = precio_maximo >= umbral_trailing
                 horas_en_pos    = (datetime.now() - ts_compra_local).total_seconds() / 3600
