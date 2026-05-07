@@ -16,6 +16,7 @@ API_KEY        = os.getenv('BINANCE_API_KEY')
 API_SECRET     = os.getenv('BINANCE_SECRET_KEY')
 TG_TOKEN       = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID     = os.getenv('TELEGRAM_CHAT_ID')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 TRADE_USDT     = float(os.getenv('TRADE_AMOUNT_USDT', '10'))
 PROFIT_PCT     = float(os.getenv('PROFIT_PCT', '0.4'))
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '10'))
@@ -672,6 +673,58 @@ def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts):
 
     return True, ""
 
+def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hist_stats):
+    """
+    Consulta GPT-4o-mini para validar la oportunidad de entrada.
+    Retorna (recomendar: bool, confianza: float, razon: str)
+    Si la API no esta disponible, aprueba por defecto.
+    """
+    if not OPENAI_API_KEY:
+        return True, 0.5, "sin clave IA"
+
+    hist_txt = (f"wins={hist_stats.get('wins',0)} stop_losses={hist_stats.get('stop_losses',0)}"
+                if hist_stats else "sin historial")
+
+    prompt = (
+        "Eres un trader cuantitativo experto en altcoins de Binance Spot. "
+        "Evalua si esta es una buena entrada de compra ahora mismo.\n\n"
+        f"Par: {symbol}\n"
+        f"RSI: {rsi:.1f}  (< 35 sobrevendido, > 65 sobrecomprado)\n"
+        f"Posicion Bollinger: {bb_pos:.2f}  (0.0 = banda inferior, 1.0 = banda superior)\n"
+        f"Ratio volumen reciente: {vol_ratio:.1f}x  (> 1.5 = momentum entrando)\n"
+        f"Rebote detectado: {rebote}\n"
+        f"BTC tendencia 1h: {btc_cambio:+.2f}%  Regimen: {regimen}\n"
+        f"Historial de esta moneda: {hist_txt}\n\n"
+        "Responde SOLO con JSON valido (sin texto extra):\n"
+        "{\"comprar\": true, \"confianza\": 0.85, \"razon\": \"RSI bajo + volumen\"}"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 80,
+                "temperature": 0.1
+            },
+            timeout=10
+        )
+        import re
+        text = resp.json()['choices'][0]['message']['content'].strip()
+        m = re.search(r'\{.*?\}', text, re.DOTALL)
+        if m:
+            r = json.loads(m.group())
+            return bool(r.get('comprar', True)), float(r.get('confianza', 0.5)), str(r.get('razon', ''))
+    except Exception as e:
+        log.warning(f"[IA] Error consultando OpenAI: {e}")
+
+    return True, 0.5, "fallback local"
+
 def historial_por_moneda():
     """
     Lee trades_log.csv y calcula el rendimiento real de cada moneda.
@@ -1093,6 +1146,20 @@ def run():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
+                # Validacion IA: consulta GPT-4o-mini antes de ejecutar compra
+                score_coin, rsi_coin, _, bb_pos_coin, vol_ratio_coin, rebote_coin = evaluar_moneda(symbol)
+                hist_coin = historial_por_moneda().get(symbol, {})
+                ia_comprar, ia_conf, ia_razon = consultar_ia(
+                    symbol, rsi_coin, bb_pos_coin, vol_ratio_coin,
+                    rebote_coin, btc_c, regimen, hist_coin
+                )
+                log.info(f"[IA] {'✓ COMPRAR' if ia_comprar else '✗ ESPERAR'} ({ia_conf:.0%}) — {ia_razon}")
+                if not ia_comprar and ia_conf >= 0.70:
+                    log.warning(f"[IA] Entrada rechazada con {ia_conf:.0%} confianza — volviendo a analizar")
+                    estado = "ANALIZANDO"
+                    time.sleep(60)
+                    continue
+
                 precio_esperado       = get_price(symbol)
                 precio_compra, qty    = ejecutar_compra(symbol, capital_operando)
                 slippage_real         = abs(precio_compra - precio_esperado) / precio_esperado
@@ -1111,7 +1178,15 @@ def run():
                                 'objetivo_venta': objetivo_venta, 'qty': qty,
                                 'precio_maximo': precio_maximo, 'ciclos': ciclos,
                                 'ts_compra': ts_compra.strftime('%Y-%m-%d %H:%M:%S')})
-                telegram(f"🟢 COMPRA [{regimen}]\nMoneda: {symbol}\nPrecio: ${precio_compra:.8f}\nObjetivo: ${objetivo_venta:.8f} (+{profit_dinamico}%)\nRSI: {rsi_actual}\nCapital: ${capital_operando}")
+                telegram(
+                    f"🟢 COMPRA [{regimen}]\n"
+                    f"Moneda: {symbol}\n"
+                    f"Precio: ${precio_compra:.8f}\n"
+                    f"Objetivo: ${objetivo_venta:.8f} (+{profit_dinamico}%)\n"
+                    f"RSI: {rsi_actual} | BB: {bb_pos_coin:.2f} | Vol: {vol_ratio_coin:.1f}x\n"
+                    f"🤖 IA ({ia_conf:.0%}): {ia_razon}\n"
+                    f"Capital: ${capital_operando:.4f} USDT"
+                )
 
             # ── ESPERAR SUBIDA ────────────────────────────────────────────────
             elif estado == "ESPERANDO_SUBIDA":
