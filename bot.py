@@ -1141,7 +1141,12 @@ def run():
 
                 print_dashboard(estado_txt, symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual, btc_info=(btc_c, btc_t))
 
-                if ya_activo_trail and precio_actual <= trailing_stop:
+                # Time stop: si llevamos mas de 72h sin llegar al objetivo, vender y reiniciar
+                if horas_en_pos >= 72:
+                    log.warning(f"[TIME STOP] {horas_en_pos:.1f}h en posicion sin alcanzar objetivo — vendiendo")
+                    telegram(f"⏱ TIME STOP 3 DIAS\nMoneda: {symbol}\nTiempo: {horas_en_pos:.1f}h\nPosicion: {caida_pct:+.2f}%\nVendiendo y reiniciando busqueda...")
+                    estado = "VENDIENDO"
+                elif ya_activo_trail and precio_actual <= trailing_stop:
                     log.info(f"[TRAILING] Max=${precio_maximo:.8f} | Vendiendo en ${precio_actual:.8f}")
                     estado = "VENDIENDO"
                 elif not ya_activo_trail and precio_actual >= objetivo_venta:
@@ -1160,28 +1165,35 @@ def run():
                     ganancia_pct   = (precio_venta - precio_compra) / precio_compra * 100
                     slippage_real  = abs(precio_venta - precio_esperado) / precio_esperado
                     ganancias_data['total_usdt'] += ganancia_ciclo
+                    # Actualizar capital con el saldo real de Binance post-venta
+                    try:
+                        usdt_real = float(client.get_asset_balance(asset='USDT')['free'])
+                        if usdt_real > 0.5:
+                            ganancias_data['capital'] = round(usdt_real, 4)
+                    except Exception:
+                        pass
                     ciclos += 1
                     guardar_ganancias(ganancias_data)
                     riesgo = registrar_resultado_ciclo(riesgo, ganancia_pct, slippage_real)
                     registrar_en_reporte(ganancia_ciclo, symbol)
+                    razon_cierre = 'TIME_STOP_3D' if duracion_seg >= 259200 else 'TRAILING/OBJETIVO'
                     registrar_csv(symbol, precio_compra, precio_venta, qty,
                                   ganancia_ciclo, ganancia_pct, slippage_real,
-                                  ganancias_data['capital'], duracion_seg, 'TRAILING/OBJETIVO')
+                                  ganancias_data['capital'], duracion_seg, razon_cierre)
                     ultimo_trade_ts = datetime.now()
-                    # Cooldown: si gano, esperar antes de re-entrar a esta moneda
                     if ganancia_ciclo > 0:
                         cooldown_ganadores[symbol] = datetime.now() + timedelta(minutes=COOLDOWN_GANADOR_MIN)
+                    emoji = "💰" if ganancia_ciclo >= 0 else "📉"
                     log.info(f"[CICLO {ciclos}] {ganancia_pct:+.3f}% | ${ganancia_ciclo:+.4f} USDT | Slippage: {slippage_real*100:.4f}%")
                     sharpe = calcular_sharpe(riesgo)
                     telegram(
-                        f"💰 GANANCIA — Ciclo #{ciclos}\n"
+                        f"{emoji} CICLO #{ciclos} — {razon_cierre}\n"
                         f"Moneda: {symbol}\n"
                         f"Compra:  ${precio_compra:.8f}\n"
                         f"Venta:   ${precio_venta:.8f}\n"
-                        f"Ganancia: {ganancia_pct:+.3f}% (${ganancia_ciclo:+.4f} USDT)\n"
-                        f"Reservado: ${ganancias_data['total_usdt']:.4f} USDT\n"
-                        f"Capital: ${ganancias_data['capital']:.2f} USDT\n"
-                        f"Sharpe: {sharpe:.2f}" if sharpe else ""
+                        f"Resultado: {ganancia_pct:+.3f}% (${ganancia_ciclo:+.4f} USDT)\n"
+                        f"Capital: ${ganancias_data['capital']:.4f} USDT\n"
+                        + (f"Sharpe: {sharpe:.2f}" if sharpe else "")
                     )
                 estado = "ANALIZANDO"
                 precio_compra = objetivo_venta = qty = precio_maximo = ts_compra = None
