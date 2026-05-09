@@ -894,19 +894,68 @@ def elegir_mejor_moneda(cooldown_ganadores=None):
     log.info(f"Seleccionada: {mejor[1]} (Score final={mejor[0]:.1f})")
     return mejor[1], mejor[2], mejor[3]
 
-# ── Limpieza automatica al iniciar ───────────────────────────────────────────
+# ── Limpieza y recuperacion al iniciar ───────────────────────────────────────
+def detectar_posicion_activa():
+    """
+    Al reiniciar (Railway u otra causa), detecta si habia una compra abierta.
+    Si hay una moneda con valor >= $2 USDT, la recupera como posicion activa
+    usando el precio actual como referencia y calculando un nuevo objetivo.
+    Retorna un dict de estado recuperado, o None si no habia nada.
+    """
+    try:
+        balances = client.get_account()['balances']
+        for b in balances:
+            asset = b['asset']
+            libre = float(b['free'])
+            if asset in ('USDT', 'BNB') or libre <= 0:
+                continue
+            symbol = asset + 'USDT'
+            try:
+                precio  = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                valor   = libre * precio
+                if valor < 2.0:
+                    continue
+                # Posicion activa detectada — recuperar con precio actual como entrada
+                objetivo_pct = calcular_objetivo_dinamico(symbol)
+                objetivo     = precio * (1 + objetivo_pct / 100)
+                log.info(f"[RECUPERACION] Posicion activa detectada: {libre} {asset} = ${valor:.4f} USDT")
+                telegram(
+                    f"♻️ Posicion recuperada tras reinicio\n"
+                    f"Moneda: {symbol}\n"
+                    f"Balance: {libre} {asset} (${valor:.4f} USDT)\n"
+                    f"Nuevo objetivo: +{objetivo_pct}% desde precio actual"
+                )
+                return {
+                    'symbol': symbol,
+                    'estado': 'ESPERANDO_SUBIDA',
+                    'precio_compra': precio,
+                    'objetivo_venta': objetivo,
+                    'qty': libre,
+                    'precio_maximo': precio,
+                    'ciclos': 0,
+                    'ts_compra': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning(f"[RECUPERACION] Error: {e}")
+    return None
+
 def limpiar_monedas_sueltas():
+    """Vende solo dust (< $2). Posiciones activas se recuperan con detectar_posicion_activa()."""
     try:
         balances = client.get_account()['balances']
         for b in balances:
             asset  = b['asset']
             libre  = float(b['free'])
-            if asset == 'USDT' or libre <= 0:
+            if asset in ('USDT', 'BNB') or libre <= 0:
                 continue
             symbol = asset + 'USDT'
             try:
                 precio_coin = float(client.get_symbol_ticker(symbol=symbol)['price'])
                 valor_usdt  = libre * precio_coin
+                if valor_usdt >= 2.0:
+                    continue  # posicion activa — no tocar, detectar_posicion_activa la maneja
                 if valor_usdt < MIN_VALOR_VENTA:
                     log.info(f"Dust ignorado: {libre} {asset} (${valor_usdt:.4f} USDT)")
                     continue
@@ -914,16 +963,15 @@ def limpiar_monedas_sueltas():
                 qty       = round_qty(libre, step, dec)
                 if qty <= 0:
                     continue
-                log.info(f"Moneda suelta detectada: {qty} {asset} — vendiendo...")
+                log.info(f"Dust vendible: {qty} {asset} — vendiendo...")
                 order     = client.order_market_sell(symbol=symbol, quantity=qty)
                 filled    = float(order['executedQty'])
                 avg_price = float(order['cummulativeQuoteQty']) / filled
-                log.info(f"Vendido {filled} {asset} a ${avg_price:.8f} | Recibido: ${filled * avg_price:.4f} USDT")
+                log.info(f"Vendido {filled} {asset} a ${avg_price:.8f} | ${filled * avg_price:.4f} USDT")
             except Exception as e:
                 log.warning(f"No se pudo vender {asset}: {e}")
     except Exception as e:
         log.warning(f"Error al limpiar monedas: {e}")
-    borrar_estado()
 
 # ── Utilidades Binance ────────────────────────────────────────────────────────
 def get_price(symbol):
@@ -1031,9 +1079,15 @@ def run():
     telegram(f"🤖 Bot iniciado\nCapital real: ${ganancias_data['capital']:.4f} USDT\nMonedas: {len(SYMBOLS)}\nObjetivo: +{PROFIT_PCT}% | Sin Stop Loss | Trailing: -{TRAILING_PCT}%\n\nAnalizando mercado...")
 
     ciclos = 0
+
+    # 1. Intentar recuperar posicion activa del wallet (sobrevive reinicios de Railway)
+    posicion_recuperada = detectar_posicion_activa()
+
+    # 2. Limpiar solo dust (monedas < $2), nunca posiciones activas
     limpiar_monedas_sueltas()
 
-    estado_previo = cargar_estado()
+    # 3. Restaurar estado: posicion del wallet > estado.json > inicio limpio
+    estado_previo = posicion_recuperada or cargar_estado()
     if estado_previo:
         symbol         = estado_previo['symbol']
         estado         = estado_previo['estado']
