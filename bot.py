@@ -639,10 +639,10 @@ def imbalance_orderbook(symbol, capital_operando):
     except Exception:
         return 0.5, "NEUTRA", True
 
-def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts):
+def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts, omitir_ob=False):
     """
     Checklist pre-trade. Retorna (ok, razon_rechazo).
-    TODOS los checks deben pasar para operar.
+    omitir_ob=True salta el check de order book (modo forzado tras horas bloqueado).
     """
     ahora = datetime.now()
 
@@ -664,12 +664,13 @@ def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts):
     if riesgo['perdidas_consecutivas'] >= CB_PERDIDAS_CONSECUTIVAS:
         return False, f"Perdidas consecutivas: {riesgo['perdidas_consecutivas']}/{CB_PERDIDAS_CONSECUTIVAS}"
 
-    # 5. Order book: liquidez y presion compradora
-    ratio, presion, liquidez_ok = imbalance_orderbook(symbol, capital_operando)
-    if presion == "VENDEDORA":
-        return False, f"Order book dominado por vendedores (ratio={ratio:.2f})"
-    if not liquidez_ok:
-        return False, f"Liquidez insuficiente en order book"
+    # 5. Order book: liquidez y presion compradora (se omite en modo forzado)
+    if not omitir_ob:
+        ratio, presion, liquidez_ok = imbalance_orderbook(symbol, capital_operando)
+        if presion == "VENDEDORA":
+            return False, f"Order book dominado por vendedores (ratio={ratio:.2f})"
+        if not liquidez_ok:
+            return False, f"Liquidez insuficiente en order book"
 
     return True, ""
 
@@ -1057,6 +1058,7 @@ def run():
     riesgo               = cargar_riesgo()
     ultimo_sharpe_check  = datetime.now()
     ultimo_aviso_vivo    = datetime.now()
+    ultimo_trade_real    = datetime.now()  # para detectar bloqueo prolongado
 
     while True:
         try:
@@ -1138,24 +1140,38 @@ def run():
             elif estado == "COMPRANDO":
                 print_dashboard(estado, symbol, precio_actual, None, None, None, None, ciclos, ganancias_data, rsi_actual, btc_info=(btc_c, btc_t))
 
-                # Checklist pre-trade: todos los checks deben pasar
-                ok, razon = validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts)
+                # Calcular horas bloqueado sin completar un trade real
+                horas_sin_operar = (datetime.now() - ultimo_trade_real).total_seconds() / 3600
+                modo_forzado = horas_sin_operar >= 6  # tras 6h relaja filtros
+                if horas_sin_operar >= 12:
+                    log.warning(f"[BLOQUEO] {horas_sin_operar:.1f}h sin operar — modo forzado total")
+                elif modo_forzado:
+                    log.info(f"[BLOQUEO] {horas_sin_operar:.1f}h sin operar — relajando filtros")
+
+                # Checklist pre-trade (OB se omite en modo forzado)
+                ok, razon = validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts,
+                                              omitir_ob=modo_forzado)
                 if not ok:
                     log.warning(f"[PRE-TRADE] Check fallido: {razon} — volviendo a analizar")
                     estado = "ANALIZANDO"
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                # Validacion IA: consulta GPT-4o-mini antes de ejecutar compra
+                # Validacion IA (se omite completamente tras 12h bloqueado)
                 score_coin, rsi_coin, _, bb_pos_coin, vol_ratio_coin, rebote_coin = evaluar_moneda(symbol)
                 hist_coin = historial_por_moneda().get(symbol, {})
-                ia_comprar, ia_conf, ia_razon = consultar_ia(
-                    symbol, rsi_coin, bb_pos_coin, vol_ratio_coin,
-                    rebote_coin, btc_c, regimen, hist_coin
-                )
+                if horas_sin_operar >= 12:
+                    ia_comprar, ia_conf, ia_razon = True, 0.0, f"modo forzado ({horas_sin_operar:.0f}h sin trade)"
+                else:
+                    ia_comprar, ia_conf, ia_razon = consultar_ia(
+                        symbol, rsi_coin, bb_pos_coin, vol_ratio_coin,
+                        rebote_coin, btc_c, regimen, hist_coin
+                    )
                 log.info(f"[IA] {'✓ COMPRAR' if ia_comprar else '✗ ESPERAR'} ({ia_conf:.0%}) — {ia_razon}")
-                if not ia_comprar and ia_conf >= 0.70:
-                    log.warning(f"[IA] Entrada rechazada con {ia_conf:.0%} confianza — volviendo a analizar")
+                # Umbral de rechazo sube con el tiempo: 70% normal, 85% tras 6h
+                umbral_rechazo = 0.85 if modo_forzado else 0.70
+                if not ia_comprar and ia_conf >= umbral_rechazo:
+                    log.warning(f"[IA] Entrada rechazada ({ia_conf:.0%} >= {umbral_rechazo:.0%}) — esperando 60s")
                     estado = "ANALIZANDO"
                     time.sleep(60)
                     continue
@@ -1255,7 +1271,8 @@ def run():
                     registrar_csv(symbol, precio_compra, precio_venta, qty,
                                   ganancia_ciclo, ganancia_pct, slippage_real,
                                   ganancias_data['capital'], duracion_seg, razon_cierre)
-                    ultimo_trade_ts = datetime.now()
+                    ultimo_trade_ts   = datetime.now()
+                    ultimo_trade_real = datetime.now()  # resetea el contador de bloqueo
                     if ganancia_ciclo > 0:
                         cooldown_ganadores[symbol] = datetime.now() + timedelta(minutes=COOLDOWN_GANADOR_MIN)
                     emoji = "💰" if ganancia_ciclo >= 0 else "📉"
