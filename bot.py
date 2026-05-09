@@ -42,13 +42,16 @@ OB_IMBALANCE_MIN      = 0.38  # Ratio minimo de presion compradora (bajo=vendedo
 TRADES_CSV            = 'trades_log.csv'
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+import sys, io
+if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.FileHandler('operaciones.log', encoding='utf-8'),
-        logging.StreamHandler()
+        logging.StreamHandler(stream=sys.stdout)
     ]
 )
 log = logging.getLogger()
