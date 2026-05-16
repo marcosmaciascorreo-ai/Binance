@@ -38,7 +38,7 @@ CB_SLIPPAGE_MULT         = 2.0    # Nivel 1: slippage real > 2x estimado → pau
 # ── Nuevos parametros de precision ────────────────────────────────────────────
 TIME_STOP_HORAS       = 6     # Horas max en posicion antes de forzar venta
 INTERVALO_MIN_TRADES  = 120   # Segundos minimos entre operaciones completadas
-OB_IMBALANCE_MIN      = 0.38  # Ratio minimo de presion compradora (bajo=vendedores dominan)
+OB_IMBALANCE_MIN      = 0.30  # Meme coins: 0.30 (mas permisivo que altcoins normales)
 TRADES_CSV            = 'trades_log.csv'
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -820,29 +820,27 @@ def registrar_csv(symbol, precio_compra, precio_venta, qty, ganancia_neta,
 def estado_btc():
     """
     Revisa tendencia BTC en 1h y 15min con velas reales.
-    Retorna (seguro, cambio_1h, tendencia)
+    Retorna (seguro, cambio_1h, cambio_15m, tendencia)
     """
     try:
-        # Velas de 1h — ultimas 2 para cambio real de 1h
         klines_1h  = client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_1HOUR, limit=2)
         closes_1h  = [float(k[4]) for k in klines_1h]
         cambio_1h  = (closes_1h[-1] - closes_1h[0]) / closes_1h[0] * 100
 
-        # Velas de 15min — ultimas 2 para cambio real de 15min
         klines_15m = client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_15MINUTE, limit=2)
         closes_15m = [float(k[4]) for k in klines_15m]
         cambio_15m = (closes_15m[-1] - closes_15m[0]) / closes_15m[0] * 100
 
         if cambio_1h < -2.5 or cambio_15m < -1.0:
-            return False, cambio_1h, "BAJISTA FUERTE ⚠"
+            return False, cambio_1h, cambio_15m, "BAJISTA FUERTE"
         elif cambio_1h < -1.0:
-            return True, cambio_1h, "BAJISTA LEVE"
+            return True, cambio_1h, cambio_15m, "BAJISTA LEVE"
         elif cambio_1h > 1.0:
-            return True, cambio_1h, "ALCISTA ✓"
+            return True, cambio_1h, cambio_15m, "ALCISTA"
         else:
-            return True, cambio_1h, "NEUTRAL"
+            return True, cambio_1h, cambio_15m, "NEUTRAL"
     except Exception:
-        return True, 0.0, "DESCONOCIDO"
+        return True, 0.0, 0.0, "DESCONOCIDO"
 
 COOLDOWN_GANADOR_MIN = 20  # minutos de espera antes de re-entrar a una moneda que acaba de ganar
 
@@ -850,8 +848,8 @@ def elegir_mejor_moneda(cooldown_ganadores=None):
     log.info("Analizando monedas con scoring avanzado + historial...")
 
     # Termometro BTC
-    btc_seguro, btc_cambio, btc_tendencia = estado_btc()
-    log.info(f"  BTC 1h: {btc_cambio:+.2f}% — {btc_tendencia}")
+    btc_seguro, btc_cambio, btc_15m, btc_tendencia = estado_btc()
+    log.info(f"  BTC 1h: {btc_cambio:+.2f}%  15m: {btc_15m:+.2f}% — {btc_tendencia}")
 
     if not btc_seguro:
         log.info(f"  BTC bajista — analizando monedas de todos modos (solo CRISIS bloquea)")
@@ -877,7 +875,6 @@ def elegir_mejor_moneda(cooldown_ganadores=None):
         try:
             score, rsi, precio, bb_pos, vol_ratio, rebote = evaluar_moneda(symbol)
 
-            # Ajuste por historial real de la moneda
             hist = historial.get(symbol, {})
             adj  = hist.get('score_adj', 0)
             wins = hist.get('wins', 0)
@@ -888,19 +885,20 @@ def elegir_mejor_moneda(cooldown_ganadores=None):
             hist_txt   = f"Hist:{wins}G/{sls}SL" if wins + sls > 0 else "Hist:nuevo"
             adj_txt    = f"({adj:+.0f})" if adj != 0 else ""
             log.info(f"  {symbol:<16} RSI={rsi:<6} Score={score_final:>6.1f}{adj_txt:<5}  BB:{bb_pos:.2f}  Vol:{vol_ratio:.1f}x  {hist_txt}  {rebote_txt}")
-            resultados.append((score_final, symbol, rsi, precio))
+            # guardamos todos los datos para no re-evaluar en COMPRANDO
+            resultados.append((score_final, symbol, rsi, precio, bb_pos, vol_ratio, rebote, hist))
         except Exception as e:
             log.warning(f"  {symbol} error: {e}")
 
     if not resultados:
         symbol = SYMBOLS[0]
         precio = float(client.get_symbol_ticker(symbol=symbol)['price'])
-        return symbol, 50.0, precio
+        return symbol, 50.0, precio, 0.5, 1.0, False, {}
 
     resultados.sort(key=lambda x: x[0])
     mejor = resultados[0]
-    log.info(f"Seleccionada: {mejor[1]} (Score final={mejor[0]:.1f})")
-    return mejor[1], mejor[2], mejor[3]
+    log.info(f"Seleccionada: {mejor[1]} (Score={mejor[0]:.1f}, RSI={mejor[2]:.1f}, BB={mejor[4]:.2f})")
+    return mejor[1], mejor[2], mejor[3], mejor[4], mejor[5], mejor[6], mejor[7]
 
 # ── Limpieza y recuperacion al iniciar ───────────────────────────────────────
 def detectar_posicion_activa():
@@ -1117,6 +1115,10 @@ def run():
         ts_compra      = None
 
     rsi_actual           = None
+    bb_pos_coin          = 0.5
+    vol_ratio_coin       = 1.0
+    rebote_coin          = False
+    hist_coin            = {}
     ultimo_aviso_bajista = None
     ultimo_trade_ts      = None
     cooldown_ganadores   = {}
@@ -1169,37 +1171,37 @@ def run():
 
             precio_actual = get_price(symbol)
 
-            # ── Regimen de mercado ────────────────────────────────────────────
-            btc_seguro, btc_c, btc_t = estado_btc()
-            regimen, factor_capital  = regimen_mercado(btc_c, (btc_c / 12))  # aprox 15m
-            capital_operando         = round(capital_actual, 4)  # usa todo el USDT disponible
+            # ── Regimen de mercado (usa 15m real, no aproximacion) ────────────
+            btc_seguro, btc_c, btc_15m, btc_t = estado_btc()
+            regimen, _       = regimen_mercado(btc_c, btc_15m)
+            capital_operando = round(capital_actual, 4)
 
             # ── ANALIZAR ──────────────────────────────────────────────────────
             if estado == "ANALIZANDO":
                 print_dashboard(f"Analizando... [{regimen}]", symbol, precio_actual, None, None, None, None, ciclos, ganancias_data, None, btc_info=(btc_c, btc_t))
 
                 if regimen == "CRISIS":
-                    log.warning("Regimen CRISIS — bot en espera")
+                    log.warning(f"Regimen CRISIS — BTC 15m: {btc_15m:+.2f}% — esperando")
                     ahora = datetime.now()
                     if not ultimo_aviso_bajista or (ahora - ultimo_aviso_bajista).seconds > 1800:
-                        telegram(f"🚨 Regimen CRISIS detectado\nBTC: {btc_c:+.2f}%\nBot en espera...")
+                        telegram(f"CRISIS detectado\nBTC 1h: {btc_c:+.2f}%  15m: {btc_15m:+.2f}%\nEsperando...")
                         ultimo_aviso_bajista = ahora
-                    time.sleep(120)
+                    time.sleep(60)
                     continue
 
-                symbol_elegido, rsi_elegido, precio_elegido = elegir_mejor_moneda(cooldown_ganadores)
+                resultado = elegir_mejor_moneda(cooldown_ganadores)
+                symbol_elegido = resultado[0]
                 if symbol_elegido is None:
                     ahora = datetime.now()
                     if not ultimo_aviso_bajista or (ahora - ultimo_aviso_bajista).seconds > 1800:
-                        telegram(f"⚠️ BTC bajista ({btc_c:+.2f}%)\nBot en pausa temporal...")
+                        telegram(f"BTC bajista ({btc_c:+.2f}%) — pausa temporal")
                         ultimo_aviso_bajista = ahora
-                    time.sleep(120)
+                    time.sleep(60)
                 else:
-                    symbol        = symbol_elegido
-                    rsi_actual    = rsi_elegido
-                    precio_actual = precio_elegido
-                    log.info(f"Regimen: {regimen} | Capital operando: ${capital_operando} | Moneda: {symbol}")
+                    symbol, rsi_actual, precio_actual, bb_pos_coin, vol_ratio_coin, rebote_coin, hist_coin = resultado
+                    log.info(f"Regimen: {regimen} | Capital: ${capital_operando} | Moneda: {symbol}")
                     estado = "COMPRANDO"
+                    continue  # ir directo a COMPRANDO sin dormir
 
             # ── COMPRAR ───────────────────────────────────────────────────────
             elif estado == "COMPRANDO":
@@ -1222,14 +1224,12 @@ def run():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                # Validacion IA (se omite completamente tras 12h bloqueado)
-                score_coin, rsi_coin, _, bb_pos_coin, vol_ratio_coin, rebote_coin = evaluar_moneda(symbol)
-                hist_coin = historial_por_moneda().get(symbol, {})
+                # Validacion IA — usa datos ya calculados en ANALIZANDO (sin re-evaluar)
                 if horas_sin_operar >= 12:
                     ia_comprar, ia_conf, ia_razon = True, 0.0, f"modo forzado ({horas_sin_operar:.0f}h sin trade)"
                 else:
                     ia_comprar, ia_conf, ia_razon = consultar_ia(
-                        symbol, rsi_coin, bb_pos_coin, vol_ratio_coin,
+                        symbol, rsi_actual, bb_pos_coin, vol_ratio_coin,
                         rebote_coin, btc_c, regimen, hist_coin
                     )
                 log.info(f"[IA] {'✓ COMPRAR' if ia_comprar else '✗ ESPERAR'} ({ia_conf:.0%}) — {ia_razon}")
@@ -1272,7 +1272,7 @@ def run():
             # ── ESPERAR SUBIDA ────────────────────────────────────────────────
             elif estado == "ESPERANDO_SUBIDA":
                 rsi_actual      = get_rsi(symbol)
-                _, btc_c, btc_t = estado_btc()
+                _, btc_c, btc_15m, btc_t = estado_btc()
 
                 ts_compra_local = ts_compra if ts_compra else datetime.now()
 
