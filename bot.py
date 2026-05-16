@@ -406,8 +406,16 @@ def actualizar_monedas_automatico():
 
     try:
         OBJETIVO_PCT   = 0.4
-        VOLUMEN_MINIMO = 300000
-        TOP_N          = 25
+        VOLUMEN_MINIMO = 100000   # meme coins tienen menos volumen que BTC/ETH
+        TOP_N          = 20
+
+        # Palabras clave y tokens conocidos de meme coins en Binance
+        MEME_KEYWORDS = {
+            'DOGE', 'SHIB', 'PEPE', 'FLOKI', 'BONK', 'WIF', 'MEME', 'NOT',
+            'TURBO', 'BOME', 'POPCAT', 'DOGS', 'LUNC', 'NEIRO', 'SATS',
+            'HMSTR', 'CAT', 'GIGGLE', 'BRETT', 'MOG', 'BABYDOGE', 'RATS',
+            'BTTC', 'REZ', 'AIDOGE', 'MYRO', 'PONKE', 'SLERF', 'BOOK',
+        }
 
         info_exchange   = client.get_exchange_info()
         simbolos_activos = {
@@ -423,8 +431,8 @@ def actualizar_monedas_automatico():
             if t['symbol'] in simbolos_activos
             and float(t['quoteVolume']) >= VOLUMEN_MINIMO
             and float(t['lastPrice']) > 0
-            and t['symbol'].replace('USDT', '').isascii()
-            and float(t['priceChangePercent']) > -20
+            and float(t['priceChangePercent']) > -25
+            and any(k in t['symbol'] for k in MEME_KEYWORDS)
         ]
 
         resultados = []
