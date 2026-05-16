@@ -37,7 +37,7 @@ CB_SLIPPAGE_MULT         = 2.0    # Nivel 1: slippage real > 2x estimado → pau
 
 # ── Nuevos parametros de precision ────────────────────────────────────────────
 TIME_STOP_HORAS       = 6     # Horas max en posicion antes de forzar venta
-INTERVALO_MIN_TRADES  = 120   # Segundos minimos entre operaciones completadas
+INTERVALO_MIN_TRADES  = 30    # 30s entre trades — IA y OB ya filtran entradas malas
 OB_IMBALANCE_MIN      = 0.30  # Meme coins: 0.30 (mas permisivo que altcoins normales)
 TRADES_CSV            = 'trades_log.csv'
 
@@ -842,7 +842,7 @@ def estado_btc():
     except Exception:
         return True, 0.0, 0.0, "DESCONOCIDO"
 
-COOLDOWN_GANADOR_MIN = 20  # minutos de espera antes de re-entrar a una moneda que acaba de ganar
+COOLDOWN_GANADOR_MIN = 5   # 5 min cooldown tras ganancia — suficiente para meme coins
 
 def elegir_mejor_moneda(cooldown_ganadores=None):
     log.info("Analizando monedas con scoring avanzado + historial...")
