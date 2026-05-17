@@ -728,68 +728,182 @@ def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts, omitir_
 
     return True, ""
 
+def obtener_fear_greed():
+    """Fear & Greed Index de crypto — alternative.me (gratis, sin clave)."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+        d = r.json()['data'][0]
+        return int(d['value']), d['value_classification']
+    except Exception:
+        return 50, "Neutral"
+
+def calcular_indicadores_avanzados(symbol):
+    """
+    Calcula ATR, EMAs 20/50/200 y CVD en velas 15min.
+    Usado por el prompt experto de IA.
+    """
+    try:
+        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=210)
+        closes = pd.Series([float(k[4]) for k in klines])
+        highs  = pd.Series([float(k[2]) for k in klines])
+        lows   = pd.Series([float(k[3]) for k in klines])
+
+        # ATR(14) — volatilidad real por vela
+        hl  = highs - lows
+        hpc = (highs - closes.shift(1)).abs()
+        lpc = (lows  - closes.shift(1)).abs()
+        tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+        atr     = tr.rolling(14).mean().iloc[-1]
+        atr_pct = round(atr / closes.iloc[-1] * 100, 3)
+
+        # EMAs
+        ema20  = closes.ewm(span=20,  adjust=False).mean().iloc[-1]
+        ema50  = closes.ewm(span=50,  adjust=False).mean().iloc[-1]
+        ema200 = closes.ewm(span=200, adjust=False).mean().iloc[-1]
+        precio = closes.iloc[-1]
+
+        # CVD aproximado (20 velas): taker_buy_volume - taker_sell_volume
+        # kline[9] = taker buy base asset volume, kline[5] = total volume
+        cvd = sum(float(k[9]) * 2 - float(k[5]) for k in klines[-20:])
+
+        # Sesgo EMA
+        if precio > ema20 > ema50:
+            sesgo_ema = f"ALCISTA — precio({precio:.6f}) > EMA20({ema20:.6f}) > EMA50({ema50:.6f})"
+        elif precio < ema20 < ema50:
+            sesgo_ema = f"BAJISTA — precio({precio:.6f}) < EMA20({ema20:.6f}) < EMA50({ema50:.6f})"
+        else:
+            sesgo_ema = f"MIXTO — precio({precio:.6f}), EMA20({ema20:.6f}), EMA50({ema50:.6f})"
+
+        sesgo_200 = "sobre EMA200 — alcista LP" if precio > ema200 else "bajo EMA200 — bajista LP"
+        cvd_txt   = f"{'PRESION COMPRADORA' if cvd > 0 else 'PRESION VENDEDORA'} (CVD neto={cvd:.0f} unidades)"
+
+        return {
+            'atr_pct': atr_pct, 'sesgo_ema': sesgo_ema, 'sesgo_200': sesgo_200,
+            'cvd_txt': cvd_txt, 'cvd': cvd,
+            'ema20': round(ema20, 8), 'ema50': round(ema50, 8), 'ema200': round(ema200, 8),
+        }
+    except Exception:
+        return {'atr_pct': 0, 'sesgo_ema': 'N/A', 'sesgo_200': 'N/A',
+                'cvd_txt': 'N/A', 'cvd': 0, 'ema20': 0, 'ema50': 0, 'ema200': 0}
+
 def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hist_stats):
     """
-    Consulta GPT-4o-mini con prompt experto en meme coins de alta volatilidad.
+    Consulta GPT-4o-mini con sistema cuantitativo de 5 capas (Prompt Maestro).
     Retorna (recomendar: bool, confianza: float, razon: str)
     """
     if not OPENAI_API_KEY:
         return True, 0.5, "sin clave IA"
 
+    # --- Datos hist. del token ---
     wins = hist_stats.get('wins', 0) if hist_stats else 0
     sls  = hist_stats.get('stop_losses', 0) if hist_stats else 0
-    hist_txt = f"{wins} ganancias / {sls} perdidas" if wins + sls > 0 else "token nuevo sin historial"
+    hist_txt = f"{wins} ganancias / {sls} stop-losses" if wins + sls > 0 else "token nuevo — sin historial propio"
 
-    # Interpretar señales para el prompt
-    rsi_interp = ("SOBREVENDIDO — posible rebote" if rsi < 30 else
-                  "BAJO — zona de acumulacion" if rsi < 45 else
-                  "NEUTRO" if rsi < 60 else
-                  "ALTO — momentum activo" if rsi < 75 else
-                  "SOBRECOMPRADO — riesgo de dump")
-    bb_interp  = ("en banda INFERIOR — maximo descuento" if bb_pos < 0.1 else
-                  "cerca de banda inferior — zona de compra" if bb_pos < 0.25 else
-                  "zona media — neutral" if bb_pos < 0.75 else
-                  "cerca de banda superior — sobreextendido" if bb_pos < 0.9 else
-                  "en banda SUPERIOR — sobrecomprado, alto riesgo")
-    vol_interp = (f"EXPLOSION de volumen {vol_ratio:.1f}x — señal de pump" if vol_ratio > 3 else
-                  f"volumen elevado {vol_ratio:.1f}x — acumulacion activa" if vol_ratio > 1.8 else
-                  f"volumen normal {vol_ratio:.1f}x" if vol_ratio > 0.8 else
-                  f"volumen bajo {vol_ratio:.1f}x — sin interes")
+    # --- Capa 1: Microestructura / Order Flow ---
+    ind = calcular_indicadores_avanzados(symbol)
+    ob_ratio, ob_pressure, _ = imbalance_orderbook(symbol, MONTO_POR_TRADE)
 
-    prompt = f"""Eres un trader profesional especializado en meme coins y tokens de alta volatilidad en Binance Spot. Tu objetivo es identificar el momento exacto de entrada antes de un pump, evitar trampas bajistas, y maximizar la relacion riesgo/beneficio en operaciones de 1 USDT con objetivo de 10-50% de ganancia.
+    # --- Capa 3: Macro / Sentimiento ---
+    fg_value, fg_label = obtener_fear_greed()
 
-TOKEN A ANALIZAR: {symbol}
+    # --- Interpretaciones legibles ---
+    rsi_interp = ("SOBREVENDIDO extremo — rebote tecnico muy probable" if rsi < 25 else
+                  "SOBREVENDIDO — zona de acumulacion, buscar rebote" if rsi < 35 else
+                  "BAJO — posible acumulacion silenciosa" if rsi < 45 else
+                  "NEUTRO — sin sesgo claro" if rsi < 55 else
+                  "ALTO — momentum activo, pero vigilar extension" if rsi < 68 else
+                  "SOBRECOMPRADO — riesgo de correccion inminente" if rsi < 80 else
+                  "SOBRECOMPRADO EXTREMO — dump inminente, no entrar")
 
-=== INDICADORES TECNICOS ===
-RSI (14): {rsi:.1f} → {rsi_interp}
-Bollinger Bands: {bb_pos:.2f} → {bb_interp}
-Volumen reciente vs promedio: {vol_interp}
-Patron de precio: {'REBOTE — precio subiendo tras caida reciente (señal alcista)' if rebote else 'Sin patron de rebote claro'}
+    bb_interp  = ("MAXIMO DESCUENTO — precio en banda inferior, setup de compra optimo" if bb_pos < 0.10 else
+                  "cerca de banda INFERIOR — zona de compra con descuento" if bb_pos < 0.25 else
+                  "zona MEDIA-BAJA — neutral con sesgo alcista leve" if bb_pos < 0.50 else
+                  "zona MEDIA-ALTA — neutral, sin ventaja clara" if bb_pos < 0.70 else
+                  "cerca de banda SUPERIOR — sobreextendido, riesgo de rechazo" if bb_pos < 0.90 else
+                  "MAXIMO SOBRECOMPRADO — en banda superior, alto riesgo")
 
-=== CONTEXTO DE MERCADO ===
-BTC ultima hora: {btc_cambio:+.2f}% — {'RIESGO: BTC cayendo, altcoins sufren mas' if btc_cambio < -1.5 else 'BTC estable/subiendo, contexto favorable para altcoins' if btc_cambio > 0.5 else 'BTC lateral, mercado incierto'}
-Regimen actual: {regimen}
+    vol_interp = (f"EXPLOSION {vol_ratio:.1f}x — pump en curso o acumulacion masiva de ballenas" if vol_ratio > 4 else
+                  f"volumen MUY ALTO {vol_ratio:.1f}x — señal fuerte de interes institucional/ballena" if vol_ratio > 2.5 else
+                  f"volumen ELEVADO {vol_ratio:.1f}x — acumulacion activa, positivo" if vol_ratio > 1.6 else
+                  f"volumen normal {vol_ratio:.1f}x — mercado en equilibrio" if vol_ratio > 0.8 else
+                  f"volumen BAJO {vol_ratio:.1f}x — token dormido, capital muerto, evitar")
 
-=== HISTORIAL DE ESTE TOKEN ===
+    btc_txt = ("CRISIS — BTC en caida libre, altcoins sufren x2-x3, NO OPERAR" if btc_cambio < -3 else
+               "RIESGO ALTO — BTC bajando, altcoins en rojo, esperar" if btc_cambio < -1.5 else
+               "PRECAUCION — BTC presionado levemente, contexto neutro-negativo" if btc_cambio < -0.5 else
+               "BTC LATERAL — contexto neutro, depende del token individual" if btc_cambio < 0.5 else
+               "BTC POSITIVO — altcoins pueden seguir el momentum" if btc_cambio < 2 else
+               "BTC EN RALLY — altcoins en modo rotacion, oportunidad de entrada")
+
+    ob_txt = (f"PRESION COMPRADORA FUERTE ({ob_ratio:.2f}) — ballenas comprando en book" if ob_ratio > 0.60 else
+              f"ligera presion compradora ({ob_ratio:.2f})" if ob_ratio > 0.45 else
+              f"BOOK EQUILIBRADO ({ob_ratio:.2f}) — sin presion dominante" if ob_ratio > 0.35 else
+              f"PRESION VENDEDORA ({ob_ratio:.2f}) — mas oferta que demanda en book")
+
+    system_prompt = """Eres el sistema cuantitativo de decision de un hedge fund especializado en tokens de alta volatilidad en Binance Spot. Tu funcion es ejecutar un analisis de 5 capas para determinar si existe una asimetria favorable de riesgo/recompensa para una entrada con capital de riesgo de 1 USDT buscando 10-50% de ganancia.
+
+FILOSOFIA: En tokens meme y nuevos listings, el edge proviene de entrar ANTES del pump masivo. Buscamos señales de acumulacion silenciosa, momentum naciente, y confluencia de factores tecnicos + flujo de ordenes + sentimiento. Toleramos alta volatilidad porque el stop-loss es el tiempo (time-stop en 24h) y el objetivo es asimetrico.
+
+REGLAS CRITICAS:
+- Si BTC cae mas de -3%, ESPERAR siempre (colapso de mercado)
+- Si CVD es muy negativo Y volumen bajo, ESPERAR (distribucion)
+- Si RSI > 75 Y precio en banda superior, ESPERAR (sobreextendido)
+- Si OB pressure es vendedora Y RSI bajando, ESPERAR
+- COMPRAR en confluence de 3+ señales positivas"""
+
+    user_prompt = f"""=== ANALISIS CUANTITATIVO DE 5 CAPAS ===
+TOKEN: {symbol}
+FECHA/HORA: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+
+--- CAPA 1: MICROESTRUCTURA / ORDER FLOW ---
+CVD neto 20 velas (15m): {ind['cvd_txt']}
+  Raw CVD: {ind['cvd']:.0f} unidades (+ = presion compradora neta)
+Order Book Imbalance: {ob_txt}
+  Ratio buy/total: {ob_ratio:.3f} | Presion dominante: {ob_pressure}
+Volumen vs promedio: {vol_interp}
+
+--- CAPA 2: PRECIO / TECNICO ---
+RSI(14): {rsi:.1f} → {rsi_interp}
+Bollinger Bands position: {bb_pos:.3f} → {bb_interp}
+EMA Stack (15m):
+  {ind['sesgo_ema']}
+  Largo plazo: {ind['sesgo_200']}
+ATR(14) como % del precio: {ind['atr_pct']:.2f}% — {'ALTA volatilidad — amplios movimientos esperados' if ind['atr_pct'] > 5 else 'volatilidad moderada' if ind['atr_pct'] > 2 else 'baja volatilidad — token dormido'}
+Patron reciente: {'REBOTE CONFIRMADO — precio subiendo desde minimo reciente' if rebote else 'sin patron de rebote claro — precio en tendencia o lateral'}
+
+--- CAPA 3: MACRO / SENTIMIENTO ---
+Bitcoin (1h): {btc_cambio:+.2f}% → {btc_txt}
+Regimen de mercado detectado: {regimen}
+Fear & Greed Index: {fg_value}/100 — {fg_label}
+  {'EXTREMO MIEDO: mejores entradas historicamente para meme coins' if fg_value < 25 else
+   'MIEDO: buena zona de acumulacion, menos competencia compradora' if fg_value < 45 else
+   'NEUTRAL: sin edge claro por sentimiento' if fg_value < 55 else
+   'CODICIA: mercado caliente, posibles entradas tarde en el ciclo' if fg_value < 75 else
+   'CODICIA EXTREMA: cautela — mercado en euforia, dumps probables'}
+
+--- CAPA 4: RIESGO MATEMATICO ---
+Capital por operacion: 1.00 USDT (fijo)
+Objetivo de ganancia: 10-50% segun volatilidad (ATR {ind['atr_pct']:.2f}%)
+Trailing stop: 2% desde pico tras +10%
+Time-stop: 24 horas maximas en posicion
+Max drawdown aceptable: 100% del trade (1 USDT — loteria calculada)
+Ratio riesgo/recompensa objetivo: minimo 1:5
+
+--- CAPA 5: HISTORIAL DEL TOKEN ---
 {hist_txt}
 
-=== CRITERIOS DE ENTRADA (todos deben considerarse) ===
-COMPRAR si:
-- RSI < 45 Y cerca de Bollinger inferior (bb < 0.30) = clasico oversold bounce
-- Explosion de volumen (>2x) sin subida de precio = acumulacion silenciosa de ballenas
-- Rebote confirmado con RSI subiendo desde zona baja = momentum naciente
-- BTC estable o subiendo + token en descuento = setup ideal
-
-NO COMPRAR si:
-- RSI > 70 Y precio en banda superior = sobreextendido, dump inminente
-- BTC cayendo fuerte (< -2%) = todo el mercado cae, no entrar
-- Volumen bajo sin señal clara = token dormido, capital muerto
-- Ya subio mucho hoy sin consolidar = trampa para compradores tardios
-
-RESPONDE UNICAMENTE con JSON valido, sin explicaciones adicionales:
-{{"comprar": true, "confianza": 0.82, "razon": "RSI 31 oversold + vol 2.3x acumulacion + rebote"}}"""
+=== INSTRUCCION ===
+Evalua la confluencia de todas las capas. Responde UNICAMENTE con este JSON (sin texto adicional):
+{{
+  "DECISION": "COMPRAR" o "ESPERAR",
+  "CONFIANZA": numero entre 0.0 y 1.0,
+  "CONFLUENCIAS": numero de señales positivas alineadas (0-8),
+  "ALERTA": "descripcion breve del mayor riesgo si existe" o null,
+  "RAZON": "explicacion concisa de max 15 palabras"
+}}"""
 
     try:
+        import re as _re
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
@@ -798,20 +912,29 @@ RESPONDE UNICAMENTE con JSON valido, sin explicaciones adicionales:
             },
             json={
                 "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.1
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt}
+                ],
+                "max_tokens": 150,
+                "temperature": 0.05
             },
-            timeout=12
+            timeout=15
         )
-        import re
         text = resp.json()['choices'][0]['message']['content'].strip()
-        m = re.search(r'\{.*?\}', text, re.DOTALL)
+        m = _re.search(r'\{.*?\}', text, _re.DOTALL)
         if m:
             r = json.loads(m.group())
-            return bool(r.get('comprar', True)), float(r.get('confianza', 0.5)), str(r.get('razon', ''))
+            comprar   = str(r.get('DECISION', 'ESPERAR')).upper() == 'COMPRAR'
+            confianza = float(r.get('CONFIANZA', 0.5))
+            confluencias = int(r.get('CONFLUENCIAS', 0))
+            alerta    = r.get('ALERTA') or ''
+            razon     = str(r.get('RAZON', ''))
+            razon_full = f"{razon} | conf={confluencias}/8" + (f" | ALERTA: {alerta}" if alerta else "")
+            log.info(f"[IA] {symbol} → {'COMPRAR' if comprar else 'ESPERAR'} ({confianza:.2f}) — {razon_full}")
+            return comprar, confianza, razon_full
     except Exception as e:
-        log.warning(f"[IA] Error: {e}")
+        log.warning(f"[IA] Error consultando GPT: {e}")
 
     return True, 0.5, "fallback local"
 
