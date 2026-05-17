@@ -18,8 +18,7 @@ TG_TOKEN       = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID     = os.getenv('TELEGRAM_CHAT_ID')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 TRADE_USDT     = float(os.getenv('TRADE_AMOUNT_USDT', '10'))
-MONTO_POR_TRADE = float(os.getenv('MONTO_POR_TRADE', '1.0'))   # USDT por apuesta
-PROFIT_PCT     = float(os.getenv('PROFIT_PCT', '15.0'))         # objetivo 15% para degen
+PROFIT_PCT     = float(os.getenv('PROFIT_PCT', '2.0'))          # objetivo dinamico (fallback 2%)
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '10'))
 SYMBOLS        = [s.strip() for s in os.getenv('SYMBOLS', 'PEPEUSDT').split(',')]
 STATE_FILE     = 'estado.json'
@@ -27,8 +26,8 @@ GANANCIAS_FILE = 'ganancias.json'
 BLACKLIST_FILE = 'blacklist.json'
 RIESGO_FILE    = 'riesgo.json'
 KNOWN_PAIRS_FILE = 'known_pairs.json'  # registro de todos los pares vistos
-TRAILING_PCT        = 2.0   # trailing: vende si baja 2% desde el maximo (meme coins volatiles)
-TRAILING_ACTIVACION = 10.0  # trailing activa al llegar al objetivo (10%+)
+TRAILING_PCT        = 1.0   # trailing: vende si baja 1% desde el maximo (capital real)
+TRAILING_ACTIVACION = 3.0   # trailing activa al +3% (protege ganancias mas pronto)
 MIN_VALOR_VENTA     = 0.10  # ignorar balances menores a $0.10 USDT (dust)
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
@@ -42,7 +41,7 @@ TIME_STOP_HORAS       = 6     # Horas max en posicion antes de forzar venta
 INTERVALO_MIN_TRADES  = 30    # 30s entre trades
 OB_IMBALANCE_MIN      = 0.28  # degen memes: muy permisivo, la IA filtra lo demas
 TRADES_CSV            = 'trades_log.csv'
-TIME_STOP_HORAS_DEGEN = 24    # 24h max — si no pumpeó en un dia, cortar y buscar otro
+TIME_STOP_HORAS_DEGEN = 72    # 72h max (3 dias) — da tiempo a recuperar con capital real
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 import sys, io
@@ -647,16 +646,15 @@ def evaluar_moneda(symbol):
 
 def calcular_objetivo_dinamico(symbol):
     """
-    Objetivo degen: basado en la volatilidad real del token.
-    Tokens que se mueven mucho → objetivo alto para capturar el pump completo.
-    Rango: min 8%, max 50%
+    Objetivo basado en la volatilidad real del token.
+    Rango: min 1.5%, max 8% — conservador para proteger capital real.
     """
     try:
         klines    = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=48)
         rangos    = [(float(k[2]) - float(k[3])) / float(k[3]) * 100 for k in klines if float(k[3]) > 0]
-        avg_rango = sum(rangos) / len(rangos) if rangos else 2.0
-        # Objetivo = 3x el rango promedio de 15min (captura el pump, no el ruido)
-        objetivo  = max(8.0, min(50.0, avg_rango * 3.0))
+        avg_rango = sum(rangos) / len(rangos) if rangos else 1.5
+        # Objetivo = 1.5x el rango promedio de 15min (realista, no especulativo)
+        objetivo  = max(1.5, min(8.0, avg_rango * 1.5))
         return round(objetivo, 1)
     except Exception:
         return PROFIT_PCT
@@ -801,7 +799,7 @@ def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hi
 
     # --- Capa 1: Microestructura / Order Flow ---
     ind = calcular_indicadores_avanzados(symbol)
-    ob_ratio, ob_pressure, _ = imbalance_orderbook(symbol, MONTO_POR_TRADE)
+    ob_ratio, ob_pressure, _ = imbalance_orderbook(symbol, TRADE_USDT)
 
     # --- Capa 3: Macro / Sentimiento ---
     fg_value, fg_label = obtener_fear_greed()
@@ -1375,8 +1373,8 @@ def run():
             # ── Regimen de mercado (usa 15m real, no aproximacion) ────────────
             btc_seguro, btc_c, btc_15m, btc_t = estado_btc()
             regimen, _       = regimen_mercado(btc_c, btc_15m)
-            # Apuesta fija de MONTO_POR_TRADE — nunca arriesgar todo el capital
-            capital_operando = round(min(MONTO_POR_TRADE, capital_actual), 4)
+            # Usar todo el capital disponible (99% para dejar margen de fees)
+            capital_operando = round(capital_actual * 0.99, 4)
 
             # ── ANALIZAR ──────────────────────────────────────────────────────
             if estado == "ANALIZANDO":
