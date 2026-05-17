@@ -18,16 +18,17 @@ TG_TOKEN       = os.getenv('TELEGRAM_TOKEN')
 TG_CHAT_ID     = os.getenv('TELEGRAM_CHAT_ID')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 TRADE_USDT     = float(os.getenv('TRADE_AMOUNT_USDT', '10'))
-PROFIT_PCT     = float(os.getenv('PROFIT_PCT', '0.4'))
+MONTO_POR_TRADE = float(os.getenv('MONTO_POR_TRADE', '1.0'))   # USDT por apuesta
+PROFIT_PCT     = float(os.getenv('PROFIT_PCT', '15.0'))         # objetivo 15% para degen
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '10'))
 SYMBOLS        = [s.strip() for s in os.getenv('SYMBOLS', 'PEPEUSDT').split(',')]
 STATE_FILE     = 'estado.json'
 GANANCIAS_FILE = 'ganancias.json'
 BLACKLIST_FILE = 'blacklist.json'
 RIESGO_FILE    = 'riesgo.json'
-TRAILING_PCT        = 0.15  # trailing: vende si baja 0.15% desde el maximo
-TRAILING_ACTIVACION = 0.5   # trailing activa desde el mismo objetivo (PROFIT_PCT)
-MIN_VALOR_VENTA     = 0.50  # ignorar balances menores a $0.50 USDT (dust)
+TRAILING_PCT        = 2.0   # trailing: vende si baja 2% desde el maximo (meme coins volatiles)
+TRAILING_ACTIVACION = 10.0  # trailing activa al llegar al objetivo (10%+)
+MIN_VALOR_VENTA     = 0.10  # ignorar balances menores a $0.10 USDT (dust)
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CB_PERDIDAS_CONSECUTIVAS = 3      # Nivel 1: 3 perdidas seguidas → pausa 15 min
@@ -37,9 +38,10 @@ CB_SLIPPAGE_MULT         = 2.0    # Nivel 1: slippage real > 2x estimado → pau
 
 # ── Nuevos parametros de precision ────────────────────────────────────────────
 TIME_STOP_HORAS       = 6     # Horas max en posicion antes de forzar venta
-INTERVALO_MIN_TRADES  = 30    # 30s entre trades — IA y OB ya filtran entradas malas
-OB_IMBALANCE_MIN      = 0.30  # Meme coins: 0.30 (mas permisivo que altcoins normales)
+INTERVALO_MIN_TRADES  = 30    # 30s entre trades
+OB_IMBALANCE_MIN      = 0.28  # degen memes: muy permisivo, la IA filtra lo demas
 TRADES_CSV            = 'trades_log.csv'
+TIME_STOP_HORAS_DEGEN = 24    # 24h max — si no pumpeó en un dia, cortar y buscar otro
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 import sys, io
@@ -405,19 +407,10 @@ def actualizar_monedas_automatico():
     telegram("🔄 Actualizacion semanal de monedas iniciada...")
 
     try:
-        OBJETIVO_PCT   = 0.4
-        VOLUMEN_MINIMO = 100000   # meme coins tienen menos volumen que BTC/ETH
-        TOP_N          = 20
+        VOLUMEN_MINIMO = 50000    # minimo liquidez para poder entrar/salir con 1 USDT
+        TOP_N          = 25
 
-        # Palabras clave y tokens conocidos de meme coins en Binance
-        MEME_KEYWORDS = {
-            'DOGE', 'SHIB', 'PEPE', 'FLOKI', 'BONK', 'WIF', 'MEME', 'NOT',
-            'TURBO', 'BOME', 'POPCAT', 'DOGS', 'LUNC', 'NEIRO', 'SATS',
-            'HMSTR', 'CAT', 'GIGGLE', 'BRETT', 'MOG', 'BABYDOGE', 'RATS',
-            'BTTC', 'REZ', 'AIDOGE', 'MYRO', 'PONKE', 'SLERF', 'BOOK',
-        }
-
-        info_exchange   = client.get_exchange_info()
+        info_exchange    = client.get_exchange_info()
         simbolos_activos = {
             s['symbol'] for s in info_exchange['symbols']
             if s['symbol'].endswith('USDT')
@@ -430,9 +423,11 @@ def actualizar_monedas_automatico():
             t for t in tickers
             if t['symbol'] in simbolos_activos
             and float(t['quoteVolume']) >= VOLUMEN_MINIMO
-            and float(t['lastPrice']) > 0
-            and float(t['priceChangePercent']) > -25
-            and any(k in t['symbol'] for k in MEME_KEYWORDS)
+            and 0 < float(t['lastPrice']) < 0.05   # precio bajo = mas potencial de x10/x100
+            and float(t['priceChangePercent']) > -30  # no en caida libre
+            and float(t['highPrice']) > 0
+            # volatilidad intradiaria alta = rango > 5% entre high y low
+            and (float(t['highPrice']) - float(t['lowPrice'])) / float(t['lowPrice']) * 100 > 5
         ]
 
         resultados = []
@@ -442,7 +437,7 @@ def actualizar_monedas_automatico():
                 klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=288)
                 highs  = [float(k[2]) for k in klines]
                 lows   = [float(k[3]) for k in klines]
-                movs   = sum(1 for h, l in zip(highs, lows) if l > 0 and (h - l) / l * 100 >= OBJETIVO_PCT)
+                movs   = sum(1 for h, l in zip(highs, lows) if l > 0 and (h - l) / l * 100 >= 5.0)
                 resultados.append((movs, symbol))
                 time.sleep(0.1)
             except Exception:
@@ -603,18 +598,17 @@ def evaluar_moneda(symbol):
 
 def calcular_objetivo_dinamico(symbol):
     """
-    Calcula el objetivo de ganancia segun la volatilidad real de la moneda.
-    Si la moneda se mueve poco → objetivo conservador.
-    Si se mueve mucho → objetivo mayor para no vender en el primer rebote.
-    Rango: min 0.8%, max 2.5%
+    Objetivo degen: basado en la volatilidad real del token.
+    Tokens que se mueven mucho → objetivo alto para capturar el pump completo.
+    Rango: min 8%, max 50%
     """
     try:
-        klines   = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=48)
-        rangos   = [(float(k[2]) - float(k[3])) / float(k[3]) * 100 for k in klines if float(k[3]) > 0]
-        avg_rango = sum(rangos) / len(rangos) if rangos else 1.0
-        # El objetivo es la mitad del movimiento promedio, ajustado por fees
-        objetivo = max(0.8, min(2.5, avg_rango * 0.6))
-        return round(objetivo, 2)
+        klines    = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=48)
+        rangos    = [(float(k[2]) - float(k[3])) / float(k[3]) * 100 for k in klines if float(k[3]) > 0]
+        avg_rango = sum(rangos) / len(rangos) if rangos else 2.0
+        # Objetivo = 3x el rango promedio de 15min (captura el pump, no el ruido)
+        objetivo  = max(8.0, min(50.0, avg_rango * 3.0))
+        return round(objetivo, 1)
     except Exception:
         return PROFIT_PCT
 
@@ -657,9 +651,9 @@ def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts, omitir_
     """
     ahora = datetime.now()
 
-    # 1. Capital operativo suficiente
-    if capital_operando < 5.0:
-        return False, f"Capital insuficiente: ${capital_operando:.2f} (min $5)"
+    # 1. Capital operativo suficiente (1 USDT minimo para degen strategy)
+    if capital_operando < 1.0:
+        return False, f"Capital insuficiente: ${capital_operando:.2f} (min $1)"
 
     # 2. Intervalo minimo entre trades
     if ultimo_trade_ts:
@@ -687,29 +681,64 @@ def validar_pre_trade(symbol, capital_operando, riesgo, ultimo_trade_ts, omitir_
 
 def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hist_stats):
     """
-    Consulta GPT-4o-mini para validar la oportunidad de entrada.
+    Consulta GPT-4o-mini con prompt experto en meme coins de alta volatilidad.
     Retorna (recomendar: bool, confianza: float, razon: str)
-    Si la API no esta disponible, aprueba por defecto.
     """
     if not OPENAI_API_KEY:
         return True, 0.5, "sin clave IA"
 
-    hist_txt = (f"wins={hist_stats.get('wins',0)} stop_losses={hist_stats.get('stop_losses',0)}"
-                if hist_stats else "sin historial")
+    wins = hist_stats.get('wins', 0) if hist_stats else 0
+    sls  = hist_stats.get('stop_losses', 0) if hist_stats else 0
+    hist_txt = f"{wins} ganancias / {sls} perdidas" if wins + sls > 0 else "token nuevo sin historial"
 
-    prompt = (
-        "Eres un trader cuantitativo experto en altcoins de Binance Spot. "
-        "Evalua si esta es una buena entrada de compra ahora mismo.\n\n"
-        f"Par: {symbol}\n"
-        f"RSI: {rsi:.1f}  (< 35 sobrevendido, > 65 sobrecomprado)\n"
-        f"Posicion Bollinger: {bb_pos:.2f}  (0.0 = banda inferior, 1.0 = banda superior)\n"
-        f"Ratio volumen reciente: {vol_ratio:.1f}x  (> 1.5 = momentum entrando)\n"
-        f"Rebote detectado: {rebote}\n"
-        f"BTC tendencia 1h: {btc_cambio:+.2f}%  Regimen: {regimen}\n"
-        f"Historial de esta moneda: {hist_txt}\n\n"
-        "Responde SOLO con JSON valido (sin texto extra):\n"
-        "{\"comprar\": true, \"confianza\": 0.85, \"razon\": \"RSI bajo + volumen\"}"
-    )
+    # Interpretar señales para el prompt
+    rsi_interp = ("SOBREVENDIDO — posible rebote" if rsi < 30 else
+                  "BAJO — zona de acumulacion" if rsi < 45 else
+                  "NEUTRO" if rsi < 60 else
+                  "ALTO — momentum activo" if rsi < 75 else
+                  "SOBRECOMPRADO — riesgo de dump")
+    bb_interp  = ("en banda INFERIOR — maximo descuento" if bb_pos < 0.1 else
+                  "cerca de banda inferior — zona de compra" if bb_pos < 0.25 else
+                  "zona media — neutral" if bb_pos < 0.75 else
+                  "cerca de banda superior — sobreextendido" if bb_pos < 0.9 else
+                  "en banda SUPERIOR — sobrecomprado, alto riesgo")
+    vol_interp = (f"EXPLOSION de volumen {vol_ratio:.1f}x — señal de pump" if vol_ratio > 3 else
+                  f"volumen elevado {vol_ratio:.1f}x — acumulacion activa" if vol_ratio > 1.8 else
+                  f"volumen normal {vol_ratio:.1f}x" if vol_ratio > 0.8 else
+                  f"volumen bajo {vol_ratio:.1f}x — sin interes")
+
+    prompt = f"""Eres un trader profesional especializado en meme coins y tokens de alta volatilidad en Binance Spot. Tu objetivo es identificar el momento exacto de entrada antes de un pump, evitar trampas bajistas, y maximizar la relacion riesgo/beneficio en operaciones de 1 USDT con objetivo de 10-50% de ganancia.
+
+TOKEN A ANALIZAR: {symbol}
+
+=== INDICADORES TECNICOS ===
+RSI (14): {rsi:.1f} → {rsi_interp}
+Bollinger Bands: {bb_pos:.2f} → {bb_interp}
+Volumen reciente vs promedio: {vol_interp}
+Patron de precio: {'REBOTE — precio subiendo tras caida reciente (señal alcista)' if rebote else 'Sin patron de rebote claro'}
+
+=== CONTEXTO DE MERCADO ===
+BTC ultima hora: {btc_cambio:+.2f}% — {'RIESGO: BTC cayendo, altcoins sufren mas' if btc_cambio < -1.5 else 'BTC estable/subiendo, contexto favorable para altcoins' if btc_cambio > 0.5 else 'BTC lateral, mercado incierto'}
+Regimen actual: {regimen}
+
+=== HISTORIAL DE ESTE TOKEN ===
+{hist_txt}
+
+=== CRITERIOS DE ENTRADA (todos deben considerarse) ===
+COMPRAR si:
+- RSI < 45 Y cerca de Bollinger inferior (bb < 0.30) = clasico oversold bounce
+- Explosion de volumen (>2x) sin subida de precio = acumulacion silenciosa de ballenas
+- Rebote confirmado con RSI subiendo desde zona baja = momentum naciente
+- BTC estable o subiendo + token en descuento = setup ideal
+
+NO COMPRAR si:
+- RSI > 70 Y precio en banda superior = sobreextendido, dump inminente
+- BTC cayendo fuerte (< -2%) = todo el mercado cae, no entrar
+- Volumen bajo sin señal clara = token dormido, capital muerto
+- Ya subio mucho hoy sin consolidar = trampa para compradores tardios
+
+RESPONDE UNICAMENTE con JSON valido, sin explicaciones adicionales:
+{{"comprar": true, "confianza": 0.82, "razon": "RSI 31 oversold + vol 2.3x acumulacion + rebote"}}"""
 
     try:
         resp = requests.post(
@@ -721,10 +750,10 @@ def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hi
             json={
                 "model": "gpt-4o-mini",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80,
+                "max_tokens": 100,
                 "temperature": 0.1
             },
-            timeout=10
+            timeout=12
         )
         import re
         text = resp.json()['choices'][0]['message']['content'].strip()
@@ -733,7 +762,7 @@ def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hi
             r = json.loads(m.group())
             return bool(r.get('comprar', True)), float(r.get('confianza', 0.5)), str(r.get('razon', ''))
     except Exception as e:
-        log.warning(f"[IA] Error consultando OpenAI: {e}")
+        log.warning(f"[IA] Error: {e}")
 
     return True, 0.5, "fallback local"
 
@@ -1174,7 +1203,8 @@ def run():
             # ── Regimen de mercado (usa 15m real, no aproximacion) ────────────
             btc_seguro, btc_c, btc_15m, btc_t = estado_btc()
             regimen, _       = regimen_mercado(btc_c, btc_15m)
-            capital_operando = round(capital_actual, 4)
+            # Apuesta fija de MONTO_POR_TRADE — nunca arriesgar todo el capital
+            capital_operando = round(min(MONTO_POR_TRADE, capital_actual), 4)
 
             # ── ANALIZAR ──────────────────────────────────────────────────────
             if estado == "ANALIZANDO":
@@ -1297,8 +1327,8 @@ def run():
 
                 print_dashboard(estado_txt, symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual, btc_info=(btc_c, btc_t))
 
-                # Time stop: si llevamos mas de 72h sin llegar al objetivo, vender y reiniciar
-                if horas_en_pos >= 72:
+                # Time stop: 24h — si no pumpeó, cortar y buscar otro token
+                if horas_en_pos >= TIME_STOP_HORAS_DEGEN:
                     log.warning(f"[TIME STOP] {horas_en_pos:.1f}h en posicion sin alcanzar objetivo — vendiendo")
                     telegram(f"⏱ TIME STOP 3 DIAS\nMoneda: {symbol}\nTiempo: {horas_en_pos:.1f}h\nPosicion: {caida_pct:+.2f}%\nVendiendo y reiniciando busqueda...")
                     estado = "VENDIENDO"
