@@ -26,6 +26,7 @@ STATE_FILE     = 'estado.json'
 GANANCIAS_FILE = 'ganancias.json'
 BLACKLIST_FILE = 'blacklist.json'
 RIESGO_FILE    = 'riesgo.json'
+KNOWN_PAIRS_FILE = 'known_pairs.json'  # registro de todos los pares vistos
 TRAILING_PCT        = 2.0   # trailing: vende si baja 2% desde el maximo (meme coins volatiles)
 TRAILING_ACTIVACION = 10.0  # trailing activa al llegar al objetivo (10%+)
 MIN_VALOR_VENTA     = 0.10  # ignorar balances menores a $0.10 USDT (dust)
@@ -375,97 +376,145 @@ def enviar_reporte_diario():
     data['ultimo_reporte'] = ahora.strftime('%Y-%m-%d')
     guardar_reporte_dia(data)
 
-# ── Auto-actualizacion semanal de monedas ────────────────────────────────────
-SYMBOLS_UPDATE_FILE   = 'ultimo_update_monedas.json'
-_update_sesion_fecha  = None  # bandera en memoria — evita spam aunque el archivo no exista
+# ── Motor de descubrimiento de nuevos listings ───────────────────────────────
+_ultimo_escaneo_listings = None   # en memoria — evita escaneos repetidos
 
-def actualizar_monedas_automatico():
-    """Cada domingo re-escanea Binance y actualiza la lista de monedas. Solo una vez."""
-    global _update_sesion_fecha
-    ahora = datetime.now()
-    if ahora.weekday() != 6:  # Solo domingo
-        return
-
-    hoy = ahora.strftime('%Y-%m-%d')
-
-    # Bandera en memoria: ya se ejecuto hoy en esta sesion
-    if _update_sesion_fecha == hoy:
-        return
-
-    # Bandera en archivo (persiste entre reinicios del mismo dia)
-    if os.path.exists(SYMBOLS_UPDATE_FILE):
-        with open(SYMBOLS_UPDATE_FILE, 'r') as f:
-            data = json.load(f)
-        if data.get('fecha') == hoy:
-            _update_sesion_fecha = hoy  # sincronizar bandera en memoria
-            return
-
-    # Marcar inmediatamente para no repetir aunque falle
-    _update_sesion_fecha = hoy
-
-    log.info("[AUTO-UPDATE] Actualizando lista de monedas...")
-    telegram("🔄 Actualizacion semanal de monedas iniciada...")
-
+def cargar_known_pairs():
+    if not os.path.exists(KNOWN_PAIRS_FILE):
+        return set()
     try:
-        VOLUMEN_MINIMO = 50000    # minimo liquidez para poder entrar/salir con 1 USDT
-        TOP_N          = 25
+        with open(KNOWN_PAIRS_FILE, 'r') as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
 
-        info_exchange    = client.get_exchange_info()
-        simbolos_activos = {
+def guardar_known_pairs(pairs):
+    try:
+        with open(KNOWN_PAIRS_FILE, 'w') as f:
+            json.dump(list(pairs), f)
+    except Exception:
+        pass
+
+def escanear_nuevos_listings():
+    """
+    Corre cada 30 minutos. Detecta tokens recien listados en Binance
+    y tokens de baja capitalizacion con actividad inusual.
+    Actualiza SYMBOLS con los mejores candidatos.
+    """
+    global SYMBOLS, _ultimo_escaneo_listings
+    ahora = datetime.now()
+
+    # Solo cada 30 minutos
+    if _ultimo_escaneo_listings and (ahora - _ultimo_escaneo_listings).total_seconds() < 1800:
+        return
+    _ultimo_escaneo_listings = ahora
+
+    log.info("[SNIPER] Escaneando nuevos listings y tokens emergentes...")
+    try:
+        info_exchange = client.get_exchange_info()
+        todos_usdt = {
             s['symbol'] for s in info_exchange['symbols']
             if s['symbol'].endswith('USDT')
             and s['status'] == 'TRADING'
             and s['isSpotTradingAllowed']
         }
 
-        tickers = client.get_ticker()
-        pares   = [
-            t for t in tickers
-            if t['symbol'] in simbolos_activos
-            and float(t['quoteVolume']) >= VOLUMEN_MINIMO
-            and 0 < float(t['lastPrice']) < 0.05   # precio bajo = mas potencial de x10/x100
-            and float(t['priceChangePercent']) > -30  # no en caida libre
-            and float(t['highPrice']) > 0
-            # volatilidad intradiaria alta = rango > 5% entre high y low
-            and (float(t['highPrice']) - float(t['lowPrice'])) / float(t['lowPrice']) * 100 > 5
-        ]
+        known = cargar_known_pairs()
+        nuevos = todos_usdt - known if known else set()
 
-        resultados = []
-        for ticker in pares:
-            symbol = ticker['symbol']
+        if known and nuevos:
+            log.info(f"[SNIPER] {len(nuevos)} NUEVOS LISTINGS detectados: {list(nuevos)[:8]}")
+            telegram(
+                f"🚨 NUEVO LISTING EN BINANCE\n"
+                f"{', '.join(list(nuevos)[:8])}\n"
+                f"Agregando a la lista de seguimiento..."
+            )
+
+        guardar_known_pairs(todos_usdt)
+
+        # Obtener tickers 24h para filtrar
+        tickers = {t['symbol']: t for t in client.get_ticker() if t['symbol'] in todos_usdt}
+
+        candidatos = []
+        for symbol, t in tickers.items():
             try:
-                klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=288)
-                highs  = [float(k[2]) for k in klines]
-                lows   = [float(k[3]) for k in klines]
-                movs   = sum(1 for h, l in zip(highs, lows) if l > 0 and (h - l) / l * 100 >= 5.0)
-                resultados.append((movs, symbol))
-                time.sleep(0.1)
+                precio      = float(t['lastPrice'])
+                volumen_24h = float(t['quoteVolume'])
+                cambio_24h  = float(t['priceChangePercent'])
+                high_24h    = float(t['highPrice'])
+                low_24h     = float(t['lowPrice'])
+
+                # Filtros basicos de liquidez y precio
+                if precio <= 0 or volumen_24h < 30000 or precio > 0.10:
+                    continue
+                if low_24h <= 0:
+                    continue
+
+                volatilidad = (high_24h - low_24h) / low_24h * 100
+
+                # Detectar antiguedad: pocos klines diarios = recien listado
+                try:
+                    kd = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1DAY, limit=90)
+                    dias_listado = len(kd)
+                except Exception:
+                    dias_listado = 999
+
+                # Scoring de oportunidad
+                score = 0
+
+                if symbol in nuevos:
+                    score += 200          # nuevo listing = maxima prioridad
+
+                if dias_listado <= 7:
+                    score += 150          # menos de 1 semana en Binance
+                elif dias_listado <= 30:
+                    score += 80           # menos de 1 mes
+                elif dias_listado <= 90:
+                    score += 30           # menos de 3 meses
+
+                if volatilidad > 20:
+                    score += 40           # muy volatil hoy
+                elif volatilidad > 10:
+                    score += 20
+
+                if 5 < cambio_24h < 50:
+                    score += 30           # subiendo pero no sobreextendido
+                elif cambio_24h > 50:
+                    score -= 20           # ya subio demasiado
+
+                if volumen_24h > 500000:
+                    score += 20           # buena liquidez
+                elif volumen_24h > 100000:
+                    score += 10
+
+                if score > 0:
+                    candidatos.append((score, symbol, dias_listado, cambio_24h, volumen_24h))
+                    time.sleep(0.05)
+
             except Exception:
-                pass
+                continue
 
-        resultados.sort(reverse=True)
-        top_symbols = [s for _, s in resultados[:TOP_N]]
+        candidatos.sort(reverse=True)
+        top = [s for _, s, _, _, _ in candidatos[:30]]
 
-        if top_symbols:
-            global SYMBOLS
-            SYMBOLS = top_symbols
-            symbols_str = ','.join(top_symbols)
-
-            with open('config.env', 'r', encoding='utf-8') as f:
-                config = f.read()
-            import re
-            config = re.sub(r'SYMBOLS=.*', f'SYMBOLS={symbols_str}', config)
-            with open('config.env', 'w', encoding='utf-8') as f:
-                f.write(config)
-
-            with open(SYMBOLS_UPDATE_FILE, 'w') as f:
-                json.dump({'fecha': ahora.strftime('%Y-%m-%d'), 'symbols': top_symbols}, f)
-
-            log.info(f"[AUTO-UPDATE] {len(top_symbols)} monedas actualizadas")
-            telegram(f"✅ Monedas actualizadas ({len(top_symbols)})\nTop 3: {', '.join(top_symbols[:3])}")
+        if top:
+            SYMBOLS = top
+            log.info(f"[SNIPER] {len(top)} candidatos | Top 5: {top[:5]}")
+            if nuevos or candidatos:
+                mejor = candidatos[0]
+                telegram(
+                    f"🎯 Lista actualizada — {len(top)} tokens\n"
+                    f"Top candidato: {mejor[1]}\n"
+                    f"  Dias listado: {mejor[2]} | +{mejor[3]:.1f}% hoy\n"
+                    f"  Vol: ${mejor[4]:,.0f} USDT"
+                )
 
     except Exception as e:
-        log.error(f"[AUTO-UPDATE] Error: {e}")
+        log.error(f"[SNIPER] Error: {e}")
+
+def actualizar_monedas_automatico():
+    """Wrapper para compatibilidad — llama al nuevo motor de sniper."""
+    escanear_nuevos_listings()
 
 # ── Blacklist dinamica ────────────────────────────────────────────────────────
 def cargar_blacklist():
