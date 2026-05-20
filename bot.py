@@ -501,14 +501,6 @@ def escanear_nuevos_listings():
         if top:
             SYMBOLS = top
             log.info(f"[SNIPER] {len(top)} candidatos | Top 5: {top[:5]}")
-            if nuevos or candidatos:
-                mejor = candidatos[0]
-                telegram(
-                    f"🎯 Lista actualizada — {len(top)} tokens\n"
-                    f"Top candidato: {mejor[1]}\n"
-                    f"  Dias listado: {mejor[2]} | +{mejor[3]:.1f}% hoy\n"
-                    f"  Vol: ${mejor[4]:,.0f} USDT"
-                )
 
     except Exception as e:
         log.error(f"[SNIPER] Error: {e}")
