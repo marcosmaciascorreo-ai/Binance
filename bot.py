@@ -1,7 +1,12 @@
 import os
+import re
+import sys
+import io
+import csv
 import time
 import json
 import logging
+import statistics
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -37,14 +42,12 @@ CB_DRAWDOWN_DIARIO       = 5.0    # Nivel 3: -5% diario → parada total
 CB_SLIPPAGE_MULT         = 2.0    # Nivel 1: slippage real > 2x estimado → pausa
 
 # ── Nuevos parametros de precision ────────────────────────────────────────────
-TIME_STOP_HORAS       = 6     # Horas max en posicion antes de forzar venta
 INTERVALO_MIN_TRADES  = 30    # 30s entre trades
 OB_IMBALANCE_MIN      = 0.28  # degen memes: muy permisivo, la IA filtra lo demas
 TRADES_CSV            = 'trades_log.csv'
 TIME_STOP_HORAS_DEGEN = 72    # 72h max (3 dias) — da tiempo a recuperar con capital real
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-import sys, io
 if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 logging.basicConfig(
@@ -209,7 +212,6 @@ def calcular_sharpe(riesgo):
     rendimientos = riesgo['historial_rendimientos']
     if len(rendimientos) < MIN_CICLOS_SHARPE:
         return None
-    import statistics
     promedio = sum(rendimientos) / len(rendimientos)
     tasa_libre = 0.0137 / 100  # 5% anual → diario → por ciclo es minimo
     std = statistics.stdev(rendimientos) if len(rendimientos) > 1 else 0.0001
@@ -510,10 +512,6 @@ def escanear_nuevos_listings():
 
     except Exception as e:
         log.error(f"[SNIPER] Error: {e}")
-
-def actualizar_monedas_automatico():
-    """Wrapper para compatibilidad — llama al nuevo motor de sniper."""
-    escanear_nuevos_listings()
 
 # ── Blacklist dinamica ────────────────────────────────────────────────────────
 def cargar_blacklist():
@@ -838,9 +836,9 @@ def consultar_ia(symbol, rsi, bb_pos, vol_ratio, rebote, btc_cambio, regimen, hi
               f"BOOK EQUILIBRADO ({ob_ratio:.2f}) — sin presion dominante" if ob_ratio > 0.35 else
               f"PRESION VENDEDORA ({ob_ratio:.2f}) — mas oferta que demanda en book")
 
-    system_prompt = """Eres el sistema cuantitativo de decision de un hedge fund especializado en tokens de alta volatilidad en Binance Spot. Tu funcion es ejecutar un analisis de 5 capas para determinar si existe una asimetria favorable de riesgo/recompensa para una entrada con capital de riesgo de 1 USDT buscando 10-50% de ganancia.
+    system_prompt = """Eres el sistema cuantitativo de decision de un hedge fund especializado en tokens de alta volatilidad en Binance Spot. Tu funcion es ejecutar un analisis de 5 capas para determinar si existe una asimetria favorable de riesgo/recompensa para una entrada con capital real buscando 1.5-8% de ganancia.
 
-FILOSOFIA: En tokens meme y nuevos listings, el edge proviene de entrar ANTES del pump masivo. Buscamos señales de acumulacion silenciosa, momentum naciente, y confluencia de factores tecnicos + flujo de ordenes + sentimiento. Toleramos alta volatilidad porque el stop-loss es el tiempo (time-stop en 24h) y el objetivo es asimetrico.
+FILOSOFIA: En tokens meme y nuevos listings, el edge proviene de entrar ANTES del pump. Buscamos acumulacion silenciosa, momentum naciente y confluencia de factores tecnicos + flujo de ordenes + sentimiento. Trailing stop protege el capital tras alcanzar el objetivo. Time-stop de 72h evita capital muerto.
 
 REGLAS CRITICAS:
 - Si BTC cae mas de -3%, ESPERAR siempre (colapso de mercado)
@@ -880,12 +878,12 @@ Fear & Greed Index: {fg_value}/100 — {fg_label}
    'CODICIA EXTREMA: cautela — mercado en euforia, dumps probables'}
 
 --- CAPA 4: RIESGO MATEMATICO ---
-Capital por operacion: 1.00 USDT (fijo)
-Objetivo de ganancia: 10-50% segun volatilidad (ATR {ind['atr_pct']:.2f}%)
-Trailing stop: 2% desde pico tras +10%
-Time-stop: 24 horas maximas en posicion
-Max drawdown aceptable: 100% del trade (1 USDT — loteria calculada)
-Ratio riesgo/recompensa objetivo: minimo 1:5
+Capital por operacion: todo el capital disponible (sin tope fijo)
+Objetivo de ganancia: 1.5-8% segun volatilidad (ATR {ind['atr_pct']:.2f}%)
+Trailing stop: -1% desde pico maximo, activa al alcanzar +3%
+Time-stop: 72 horas maximas en posicion (3 dias)
+Proteccion: circuit breaker por drawdown diario >5% o perdidas consecutivas
+Ratio riesgo/recompensa objetivo: minimo 1:2
 
 --- CAPA 5: HISTORIAL DEL TOKEN ---
 {hist_txt}
@@ -901,7 +899,6 @@ Evalua la confluencia de todas las capas. Responde UNICAMENTE con este JSON (sin
 }}"""
 
     try:
-        import re as _re
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
@@ -920,7 +917,7 @@ Evalua la confluencia de todas las capas. Responde UNICAMENTE con este JSON (sin
             timeout=15
         )
         text = resp.json()['choices'][0]['message']['content'].strip()
-        m = _re.search(r'\{.*?\}', text, _re.DOTALL)
+        m = re.search(r'\{.*?\}', text, re.DOTALL)
         if m:
             r = json.loads(m.group())
             comprar   = str(r.get('DECISION', 'ESPERAR')).upper() == 'COMPRAR'
@@ -947,7 +944,6 @@ def historial_por_moneda():
     if not os.path.exists(TRADES_CSV):
         return {}
     try:
-        import csv
         stats = {}
         with open(TRADES_CSV, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
@@ -996,7 +992,6 @@ def historial_por_moneda():
 def registrar_csv(symbol, precio_compra, precio_venta, qty, ganancia_neta,
                   ganancia_pct, slippage, capital_post, duracion_seg, razon_cierre):
     """Guarda cada operacion en trades_log.csv para analisis posterior."""
-    import csv
     existe = os.path.exists(TRADES_CSV)
     try:
         with open(TRADES_CSV, 'a', newline='', encoding='utf-8') as f:
@@ -1332,7 +1327,7 @@ def run():
             ganancias_data = reinvertir_ganancias(ganancias_data)
             capital_actual = ganancias_data['capital']
             enviar_reporte_diario()
-            actualizar_monedas_automatico()
+            escanear_nuevos_listings()
 
             # Aviso de vida cada 2 horas — confirma que el bot sigue activo
             ahora = datetime.now()
