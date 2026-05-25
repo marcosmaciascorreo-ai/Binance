@@ -60,7 +60,7 @@ if vendidos == 0:
     print("  No habia monedas abiertas.")
 
 # Limpiar estado
-for f in ['estado.json']:
+for f in ['estado.json', 'riesgo.json']:
     if os.path.exists(f):
         os.remove(f)
         print(f"\n  Estado limpiado: {f}")

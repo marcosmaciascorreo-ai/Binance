@@ -1257,6 +1257,7 @@ def run():
     log.info("=" * 55)
 
     ganancias_data = cargar_ganancias()
+    riesgo         = cargar_riesgo()
 
     # Usar capital REAL de Binance, no el guardado en archivo
     try:
@@ -1265,6 +1266,12 @@ def run():
             ganancias_data['capital'] = round(capital_real, 4)
             guardar_ganancias(ganancias_data)
             log.info(f"Capital real de Binance: ${capital_real:.4f} USDT")
+            # Sincronizar riesgo con capital real — evita CB falsos por capital_inicio_dia stale
+            riesgo['capital_inicio_dia'] = round(capital_real, 4)
+            riesgo['capital_inicio_6h']  = round(capital_real, 4)
+            riesgo['fecha_inicio_dia']   = datetime.now().strftime('%Y-%m-%d')
+            riesgo['ts_inicio_6h']       = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            guardar_riesgo(riesgo)
     except Exception as e:
         log.warning(f"No se pudo obtener capital real: {e}")
 
@@ -1308,7 +1315,6 @@ def run():
     ultimo_aviso_bajista = None
     ultimo_trade_ts      = None
     cooldown_ganadores   = {}
-    riesgo               = cargar_riesgo()
     ultimo_sharpe_check  = datetime.now()
     ultimo_aviso_vivo    = datetime.now()
     ultimo_trade_real    = datetime.now()  # para detectar bloqueo prolongado
