@@ -34,6 +34,12 @@ KNOWN_PAIRS_FILE = 'known_pairs.json'  # registro de todos los pares vistos
 TRAILING_PCT        = 1.0   # trailing: vende si baja 1% desde el maximo (capital real)
 TRAILING_ACTIVACION = 3.0   # trailing activa al +3% (protege ganancias mas pronto)
 MIN_VALOR_VENTA     = 0.10  # ignorar balances menores a $0.10 USDT (dust)
+# ── NUEVOS PARAMETROS DE PROTECCION ─────────────────────────────────────────
+STOP_LOSS_PCT       = 6.0   # Stop Loss real: vende si baja -6% desde precio compra
+TIME_STOP_HORAS     = 24    # Time-stop reducido de 72h a 24h
+REINVERSION_AUTO    = True  # Reinvertir ganancias automaticamente post-trade
+FORZAR_ENTRADA_MIN  = 30    # Minutos sin trade antes de relajar filtros al minimo
+TIEMPO_ESPERA_CRISIS = 15   # Minutos esperando en CRISIS antes de probar igual
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 CB_PERDIDAS_CONSECUTIVAS = 3      # Nivel 1: 3 perdidas seguidas → pausa 15 min
@@ -45,7 +51,7 @@ CB_SLIPPAGE_MULT         = 2.0    # Nivel 1: slippage real > 2x estimado → pau
 INTERVALO_MIN_TRADES  = 30    # 30s entre trades
 OB_IMBALANCE_MIN      = 0.28  # degen memes: muy permisivo, la IA filtra lo demas
 TRADES_CSV            = 'trades_log.csv'
-TIME_STOP_HORAS_DEGEN = 72    # 72h max (3 dias) — da tiempo a recuperar con capital real
+TIME_STOP_HORAS_DEGEN = TIME_STOP_HORAS  # usa la nueva variable 24h
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 if hasattr(sys.stdout, 'buffer') and sys.stdout.encoding.lower() != 'utf-8':
@@ -1029,16 +1035,20 @@ def estado_btc():
         return True, 0.0, 0.0, "DESCONOCIDO"
 
 COOLDOWN_GANADOR_MIN = 5   # 5 min cooldown tras ganancia — suficiente para meme coins
+MINUTOS_SIN_TRADE_FORZAR = 45  # forzar entrada si pasan 45min sin trade
 
-def elegir_mejor_moneda(cooldown_ganadores=None):
-    log.info("Analizando monedas con scoring avanzado + historial...")
+def elegir_mejor_moneda(cooldown_ganadores=None, minutos_sin_trade=0):
+    log.info(f'Analizando monedas... ({minutos_sin_trade}min sin trade)')
+    modo_forzado = minutos_sin_trade >= MINUTOS_SIN_TRADE_FORZAR
+    if modo_forzado:
+        log.warning(f'[FORZADO] {minutos_sin_trade}min sin trade — forzando entrada')
 
     # Termometro BTC
     btc_seguro, btc_cambio, btc_15m, btc_tendencia = estado_btc()
-    log.info(f"  BTC 1h: {btc_cambio:+.2f}%  15m: {btc_15m:+.2f}% — {btc_tendencia}")
+    log.info(f'  BTC 1h: {btc_cambio:+.2f}%  15m: {btc_15m:+.2f}% — {btc_tendencia}')
 
-    if not btc_seguro:
-        log.info(f"  BTC bajista — analizando monedas de todos modos (solo CRISIS bloquea)")
+    if not btc_seguro and not modo_forzado:
+        log.info(f'  BTC bajista — analizando monedas de todos modos (solo CRISIS bloquea)')
 
     blacklist  = limpiar_blacklist_expirada()
     historial  = historial_por_moneda()
@@ -1373,16 +1383,21 @@ def run():
             if estado == "ANALIZANDO":
                 print_dashboard(f"Analizando... [{regimen}]", symbol, precio_actual, None, None, None, None, ciclos, ganancias_data, None, btc_info=(btc_c, btc_t))
 
-                if regimen == "CRISIS":
-                    log.warning(f"Regimen CRISIS — BTC 15m: {btc_15m:+.2f}% — esperando")
+                # Calcular minutos sin operar (para relajar filtros progresivamente)
+                minutos_sin_operar = int((datetime.now() - ultimo_trade_real).total_seconds() / 60)
+
+                if regimen == 'CRISIS':
+                    log.warning(f'Regimen CRISIS — BTC 15m: {btc_15m:+.2f}%')
                     ahora = datetime.now()
                     if not ultimo_aviso_bajista or (ahora - ultimo_aviso_bajista).seconds > 1800:
-                        telegram(f"CRISIS detectado\nBTC 1h: {btc_c:+.2f}%  15m: {btc_15m:+.2f}%\nEsperando...")
+                        telegram(f'CRISIS detectado\nBTC 1h: {btc_c:+.2f}%  15m: {btc_15m:+.2f}%\nEsperando...')
                         ultimo_aviso_bajista = ahora
-                    time.sleep(60)
-                    continue
+                    if minutos_sin_operar < TIEMPO_ESPERA_CRISIS:
+                        time.sleep(60)
+                        continue
+                    log.info(f'[CRISIS] {minutos_sin_operar}min — forzando entrada igual')
 
-                resultado = elegir_mejor_moneda(cooldown_ganadores)
+                resultado = elegir_mejor_moneda(cooldown_ganadores, minutos_sin_trade=minutos_sin_operar)
                 symbol_elegido = resultado[0]
                 if symbol_elegido is None:
                     ahora = datetime.now()
@@ -1490,10 +1505,15 @@ def run():
 
                 print_dashboard(estado_txt, symbol, precio_actual, precio_compra, objetivo_venta, precio_maximo, qty, ciclos, ganancias_data, rsi_actual, btc_info=(btc_c, btc_t))
 
-                # Time stop: 24h — si no pumpeó, cortar y buscar otro token
-                if horas_en_pos >= TIME_STOP_HORAS_DEGEN:
+                # ── STOP LOSS REAL: vende si baja -6% desde precio compra ──────
+                if caida_pct <= -STOP_LOSS_PCT:
+                    log.warning(f"[STOP LOSS] {caida_pct:+.2f}% — vendiendo para proteger capital")
+                    telegram(f"🛑 STOP LOSS\nMoneda: {symbol}\nCaida: {caida_pct:+.2f}%\nVendiendo...")
+                    estado = "VENDIENDO"
+                # ── TIME STOP: maximo 24h en posicion ─────────────────────────
+                elif horas_en_pos >= TIME_STOP_HORAS_DEGEN:
                     log.warning(f"[TIME STOP] {horas_en_pos:.1f}h en posicion sin alcanzar objetivo — vendiendo")
-                    telegram(f"⏱ TIME STOP 3 DIAS\nMoneda: {symbol}\nTiempo: {horas_en_pos:.1f}h\nPosicion: {caida_pct:+.2f}%\nVendiendo y reiniciando busqueda...")
+                    telegram(f"⏱ TIME STOP\nMoneda: {symbol}\nTiempo: {horas_en_pos:.1f}h\nPosicion: {caida_pct:+.2f}%\nVendiendo y buscando otra...")
                     estado = "VENDIENDO"
                 elif ya_activo_trail and precio_actual <= trailing_stop:
                     log.info(f"[TRAILING] Max=${precio_maximo:.8f} | Vendiendo en ${precio_actual:.8f}")
@@ -1514,6 +1534,14 @@ def run():
                     ganancia_pct   = (precio_venta - precio_compra) / precio_compra * 100
                     slippage_real  = abs(precio_venta - precio_esperado) / precio_esperado
                     ganancias_data['total_usdt'] += ganancia_ciclo
+                    # ── REINVERSION AUTOMATICA: ganancia -> capital ────────────
+                    if REINVERSION_AUTO and ganancia_ciclo > 0:
+                        ganancias_data['capital'] = round(
+                            ganancias_data['capital'] + ganancia_ciclo, 4
+                        )
+                        ganancias_data['total_usdt'] = round(
+                            max(ganancias_data['total_usdt'] - ganancia_ciclo, 0), 4
+                        )
                     # Actualizar capital con el saldo real de Binance post-venta
                     try:
                         usdt_real = float(client.get_asset_balance(asset='USDT')['free'])
@@ -1525,7 +1553,7 @@ def run():
                     guardar_ganancias(ganancias_data)
                     riesgo = registrar_resultado_ciclo(riesgo, ganancia_pct, slippage_real)
                     registrar_en_reporte(ganancia_ciclo, symbol)
-                    razon_cierre = 'TIME_STOP_3D' if duracion_seg >= 259200 else 'TRAILING/OBJETIVO'
+                    razon_cierre = 'STOP_LOSS' if caida_pct <= -STOP_LOSS_PCT else ('TIME_STOP' if duracion_seg >= TIME_STOP_HORAS_DEGEN * 3600 else 'TRAILING/OBJETIVO')
                     registrar_csv(symbol, precio_compra, precio_venta, qty,
                                   ganancia_ciclo, ganancia_pct, slippage_real,
                                   ganancias_data['capital'], duracion_seg, razon_cierre)
