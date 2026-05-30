@@ -270,8 +270,8 @@ def regimen_mercado(btc_cambio_1h, btc_cambio_15m):
     Clasifica el regimen de mercado actual.
     CALMA / ESTRES / CRISIS / OPORTUNIDAD
     """
-    if abs(btc_cambio_15m) > 0.3:
-        return "CRISIS", 0.0    # Movimiento BTC > 0.3% en 15min
+    if abs(btc_cambio_15m) > 1.5:
+        return "CRISIS", 0.0    # Movimiento BTC > 1.5% en 15min
     if btc_cambio_1h < -2.5 or btc_cambio_15m < -1.0:
         return "ESTRES", 0.6    # Mercado bajista fuerte → operar al 60%
     if btc_cambio_1h > 3.0:
