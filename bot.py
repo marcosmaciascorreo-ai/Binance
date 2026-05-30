@@ -68,10 +68,18 @@ logging.basicConfig(
 log = logging.getLogger()
 
 # ── Cliente Binance ───────────────────────────────────────────────────────────
+if not API_KEY or not API_SECRET:
+    log.critical("ERROR: BINANCE_API_KEY o BINANCE_SECRET_KEY no estan configuradas. Revisa las variables de entorno en Railway.")
+    sys.exit(1)
+
 client = Client(API_KEY, API_SECRET)
-server_time = client.get_server_time()
-client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
-log.info(f"Reloj sincronizado con Binance: offset {client.timestamp_offset}ms")
+try:
+    server_time = client.get_server_time()
+    client.timestamp_offset = server_time['serverTime'] - int(time.time() * 1000)
+    log.info(f"Reloj sincronizado con Binance: offset {client.timestamp_offset}ms")
+except Exception as e:
+    log.critical(f"ERROR al conectar con Binance: {e}. Verifica las API keys y la conexion.")
+    sys.exit(1)
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def telegram(mensaje):
